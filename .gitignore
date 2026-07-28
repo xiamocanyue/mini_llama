@@ -1,0 +1,8 @@
+build/
+*.o
+*.a
+*.so
+*.out
+CMakeCache.txt
+CMakeFiles/
+models/chat/Qwen2-0.5B-Instruct-Q8_0.gguf
