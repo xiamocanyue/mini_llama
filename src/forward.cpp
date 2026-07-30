@@ -26,6 +26,9 @@ Tensor ForwardAdd(const MiniLlamaModel& model, const Tensor& a, const Tensor& b)
 }
 
 Tensor EmbedToken(const MiniLlamaModel& model, int token_id) {
+    if (token_id < 0 || token_id > model.config.vocab_size) {
+        throw std::runtime_error("token id is not positive");
+    }
     int dim = model.config.dim;
     Tensor x({dim}, 0.0f);
     for (int i = 0; i < dim; i++) {

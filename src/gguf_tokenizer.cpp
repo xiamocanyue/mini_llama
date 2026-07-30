@@ -186,7 +186,7 @@ std::vector<int> GgufTokenizer::Encode(const std::string& text) const {
         //先匹配特殊字符
         bool is_match = false;
         for (auto& [special_token_str, token_id] : special_tokens_) {
-            if (pos + special_token_str.size() <= text.size() && std::memcmp(text.data() + pos, special_token_str.data(), special_token_str.size() == 0)) {
+            if (pos + special_token_str.size() <= text.size() && std::memcmp(text.data() + pos, special_token_str.data(), special_token_str.size()) == 0) {
                 result.push_back(token_id);
                 pos += special_token_str.size();
                 is_match = true;
@@ -205,6 +205,8 @@ std::vector<int> GgufTokenizer::Encode(const std::string& text) const {
                 end = p;
             }
         }
+        
+        pos = end;
 
         std::string segment = text.substr(pos, end - pos);
 

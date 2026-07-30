@@ -260,7 +260,7 @@ std::vector<Instr> ComplieTemplate(const std::string& input) {
     size_t pos = 0;
     while (pos < input.size()) {
         // 处理具有for或者if的语句
-        if (pos + 1 < input.size() && input[pos] == '{' && input[pos] == '%') {
+        if (pos + 1 < input.size() && input[pos] == '{' && input[pos + 1] == '%') {
             pos += 2;
             size_t end = input.find("%}");
             if (end == std::string::npos) {
