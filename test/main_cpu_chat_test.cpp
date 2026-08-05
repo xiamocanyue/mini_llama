@@ -207,6 +207,9 @@ int RunCpuDemo(const CpuDemoPath& demo) {
 
     MiniLlamaContext ctx(&model);
 
+    SetThreadCount(4);
+
+
     PromptBuilder builder;
     builder.SetChatTemplate("qwen2");
     ChatSession session;
@@ -230,6 +233,7 @@ int RunCpuDemo(const CpuDemoPath& demo) {
             for (auto& message : session.messages_) {
                 std::cout << message.role << ": " << message.content << '\n';
             }
+            std::cout << "thread count: " << GetThreadCount() << std::endl;
             break;
         }
         session.AddMessage("user", prompt);
