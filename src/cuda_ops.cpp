@@ -126,8 +126,8 @@ void CudaRopeDeviceInput(CudaTensor& q, CudaTensor& k, int n_heads, int n_kv_hea
 }
 
 CudaTensor CudaEmbedding(const void* embedding_data, const std::vector<int>& embedding_shape, int token_id, int device_id = 0) {
-    (void)embeding_data;
-    (void)embedint_shap;
+    (void)embedding_data;
+    (void)embedding_shape;
     (void)token_id;
     (void)device_id;
     throw CudaNotBuiltOps();

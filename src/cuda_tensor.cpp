@@ -81,13 +81,11 @@ Tensor CudaTensor::Download() const {
     return dst;
 }
 
-CudaTensor GetCudaTensorFromHost(const Tensor& src, int device_id) {
+CudaTensor CudaTensorFromHost(const Tensor& src, int device_id) {
     CudaTensor dst(src.shape, device_id);
     dst.Upload(src);
     return dst;
 }
-
-
 
 
 }

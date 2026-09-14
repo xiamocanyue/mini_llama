@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "*.cu": "cuda-cpp",
+        "*.cuh": "cuda-cpp"
+    },
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "editor.tabSize": 4,
+    "editor.insertSpaces": false,
+    "editor.detectIndentation": false
+}

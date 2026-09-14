@@ -7,7 +7,6 @@
 namespace mini_llama {
 
 class CudaTensor {
-
 public:
     CudaTensor() = default;
     explicit CudaTensor(const std::vector<int>& shape, int device_id);
@@ -57,6 +56,8 @@ private:
     CudaDeviceBuffer buffer_;
     int device_id_ = 0;
 };
+
+CudaTensor CudaTensorFromHost(const Tensor& x, int device_id = 0);
 
 
 

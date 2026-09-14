@@ -1,0 +1,20 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/data/cuda-toolkit/include"
+            ],
+            "defines": [
+                "MINI_LLAMA_USE_CUDA=1"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "compilerPath": "/data/cuda-toolkit/bin/nvcc",
+            "compileCommands": "${workspaceFolder}/build-cuda/compile_commands.json",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}

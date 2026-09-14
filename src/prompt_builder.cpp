@@ -2,6 +2,10 @@
 
 #include <cstring>
 #include <stack>
+#include "include/gguf.h"
+
+
+
 
 namespace mini_llama {
 
@@ -49,7 +53,7 @@ void SkipSpace(size_t& pos, const std::string& s) {
 
 /*
 处理Jinja 拼接消息，处理
-加号,add_generation_prompt, message['role'],message['content'],loop.first, 
+“+”,add_generation_prompt, message['role'],message['content'],loop.first, 
 message[0]['role'], message[0]['content']  
 */   
 std::string EvalExpr(const std::string& expr_s, const EvalContext& ctx) {
@@ -164,7 +168,7 @@ std::string EvalExpr(const std::string& expr_s, const EvalContext& ctx) {
     //汇总结果
     std::string result;
     for (auto& p : parts) {
-        result  += p;
+        result += p;
     }
     return result;
 }
@@ -463,6 +467,23 @@ std::string PromptBuilder::Build(const std::vector<ChatMessage>& messages) const
     return BuildPlain(messages);
 }
 
+std::string LoadChatTemplateFromGGUF(const std::string& gguf_path) {
+    std::string tmpl;
+    if (!GetGgufMetaDataString(gguf_path, "tokenizer.chat_template", tmpl)) {
+        std::string architecture;
+        if (GetGgufMetaDataString(gguf_path, "general.architecture", architecture) && architecture == "qwen2") {
+            return "qwen2";
+        }
+        return "";
+    }
+
+    if (tmpl.find("{% for message in messages %}") != std::string::npos &&
+        tmpl.find("<|im_start|>") != std::string::npos &&
+        tmpl.find("<|im_end|>") != std::string::npos) {
+        return tmpl;
+    }
+    return tmpl;
+}
 
 
 

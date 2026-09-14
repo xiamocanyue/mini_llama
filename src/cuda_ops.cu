@@ -7,7 +7,6 @@
 
 namespace mini_llama {
 namespace {
-
 constexpr int kBlockSize = 256;
 
 void CheckCudaOps(cudaError_t err, const char* caller) {
@@ -81,6 +80,7 @@ __global__ void GetMaxForSoftmaxKernel(const float* x, float* max_out, int n) {
 }
 
 //e^(x - max) / sum(e^(x - max))
+// y = e^(x - max);
 __global__ void GetExpForSoftmaxKernel(const float* x, float* y, const float* max, float* sum_out, int n) {
     __shared__ float shared[kBlockSize];
     float local_sum = 0.0f;
@@ -115,8 +115,9 @@ __global__ void SoftmaxKernel(float* y, const float* sum, int n) {
 
 //x1` = x1 * cos(m * freq) - x2 * sin(m * freq)
 //x2` = x1 * sin(m * freq) + x2 * cos(m * freq)
-//freq = 1 / theta^(2 * i / head_dim)
+//freq = 1 / theta^(2 * i / head_dim)  i是pair的下标, 2*i就是元素的下标
 //pair <x, y>，一个线程处理两个相邻的元素
+//pair_index 是处理pair的线程下标
 __global__ void RopeNormalKernel(float* x, int n_heads, int head_dim, int pos, float theta) {
     int pair_index = blockIdx.x * blockDim.x + threadIdx.x;
     int head_have_pairs = head_dim / 2;
@@ -133,11 +134,11 @@ __global__ void RopeNormalKernel(float* x, int n_heads, int head_dim, int pos, f
     float freq = 1.0f / powf(theta, static_cast<float>(num_index) / static_cast<float>(head_dim));
     float cos_val = cosf(static_cast<float>(pos) * freq);
     float sin_val = sinf(static_cast<float>(pos) * freq);
-    float x1 = x[num_index];
-    float x2 = x[num_index + 1];
+    float x1 = x[base];
+    float x2 = x[base + 1];
 
-    x[num_index] = x1 * cos_val - x2 * sin_val;
-    x[num_index + 1] = x1 * sin_val + x2 * cos_val;
+    x[base] = x1 * cos_val - x2 * sin_val;
+    x[base + 1] = x1 * sin_val + x2 * cos_val;
 }
 
 __global__ void RopeNeoXKernel(float* x, int n_heads, int head_dim, int pos, float theta) {
@@ -305,11 +306,7 @@ int GetBlockNum(int n) {
 
 } //namespace
 
-/*
-输入和输出都是 CPU Tensor
-CPU -> GPU -> CPU
-适合兼容旧的 host 调用
-*/
+
 Tensor CudaRmsNorm(const Tensor& x, const Tensor& weight, float eps, int device_id) {
     ValidateRmsNormInput(x, weight, eps, device_id);
 
@@ -322,8 +319,7 @@ Tensor CudaRmsNorm(const Tensor& x, const Tensor& weight, float eps, int device_
 
     x_dev.Upload(x.data.data(), x.Size() * sizeof(float));
     w_dev.Upload(weight.data.data(), weight.Size() * sizeof(float));
-    CheckCudaOps(cudaMemset(sum_dev.GetData(), 0, sizeof(float)), "CudaMemset(RmsNorm sum)");
-
+    CheckCudaOps(cudaMemset(sum_dev.GetData(), 0, sizeof(float)), "CudaMemset(RmsNorm sum)");    
     int n = static_cast<int>(x.Size());
     SumSquareKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(x_dev.GetData()), static_cast<float*>(sum_dev.GetData()), n);
     CheckLastKernelError("SumSquareKernel");
@@ -335,6 +331,32 @@ Tensor CudaRmsNorm(const Tensor& x, const Tensor& weight, float eps, int device_
     y_dev.Download(y.data.data(), y.Size() * sizeof(float));
     return y;
 }
+CudaTensor CudaRmsNormDeviceInput(const CudaTensor& x, const Tensor& weight, float eps, int device_id) {
+    ValidateRmsNormDeviceWeightInput(x, weight.data.data(), weight.shape, eps, device_id);
+    CudaSetDevice(device_id);
+    CudaDeviceBuffer w_dev(weight.Size() * sizeof(float), device_id);
+    w_dev.Upload(weight.data.data(), weight.Size() * sizeof(float));
+    return CudaRmsNormDeviceWeight(x, w_dev.GetData(), weight.shape, eps, device_id);
+}
+CudaTensor CudaRmsNormDeviceWeight(const CudaTensor& x, const void* weight_data, const std::vector<int>& weight_shape, float eps, int device_id) {
+    ValidateRmsNormDeviceWeightInput(x, weight_data, weight_shape, eps, device_id);
+    CudaSetDevice(device_id);
+
+    CudaTensor y(x.Shape(), device_id);
+    CudaDeviceBuffer sum_dev(sizeof(float), device_id);
+    CheckCudaOps(cudaMemset(sum_dev.GetData(), 0, sizeof(float)), "CudaMemset(sum)");
+    int n = static_cast<int>(x.GetSize());
+
+    SumSquareKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(x.GetData()), static_cast<float*>(sum_dev.GetData()), n);
+    CheckLastKernelError("SumSquareKernel(sum)");
+
+    RmsNormKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(x.GetData()), static_cast<const float*>(weight_data), 
+                static_cast<float*>(y.GetData()), static_cast<const float*>(sum_dev.GetData()), n, eps);
+    CheckLastKernelError("RmsNormKernel(x)");
+
+    return y;
+}
+
 
 Tensor CudaSilu(const Tensor& x, int device_id) {
     CudaSetDevice(device_id);
@@ -350,6 +372,20 @@ Tensor CudaSilu(const Tensor& x, int device_id) {
     y_dev.Download(y.data.data(), y.Size() * sizeof(float));
     return y;
 }
+CudaTensor CudaSiluDeviceInput(const CudaTensor& x, int device_id) {
+    if (x.GetDeviceId() != device_id) {
+        throw std::runtime_error("CudaSiluDeviceInput: this tensor device is not this device");
+    }
+    CudaSetDevice(device_id);
+    CudaTensor y(x.Shape(), device_id);
+    int n = static_cast<int>(x.GetSize());
+
+    SiluKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(x.GetData()), static_cast<float*>(y.GetData()), n);
+    CheckLastKernelError("CudaSiluDeviceInput");
+
+    return y;
+}
+
 
 Tensor CudaElementMutmul(const Tensor& a, const Tensor& b, int device_id) {
     RequireSameShape(a, b, "CudaElementMutmul");
@@ -369,6 +405,22 @@ Tensor CudaElementMutmul(const Tensor& a, const Tensor& b, int device_id) {
     y_dev.Download(y.data.data(), y.Size() * sizeof(float));
     return y;
 }
+CudaTensor CudaElementMutmulDeviceInput(const CudaTensor& a, const CudaTensor& b, int device_id) {
+    RequireSameShape(a, b, "CudaElementMutmulDeviceInput");
+    if (a.GetDeviceId() != device_id || b.GetDeviceId() != device_id) {
+        throw std::runtime_error("CudaElementMutmulDeviceInput: two tensor is not on this device");
+    }
+
+    CudaSetDevice(device_id);
+    CudaTensor y(a.Shape(), device_id);
+    int n = a.GetSize();
+
+    ElementMulmutKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(a.GetData()), static_cast<const float*>(b.GetData()), static_cast<float*>(y.GetData()), n);
+    CheckLastKernelError("ElementMulmutKernel(a * b)");
+
+    return y;  
+}
+
 
 Tensor CudaElementAdd(const Tensor& a, const Tensor& b, int device_id) {
     RequireSameShape(a, b, "CudaElementAdd");
@@ -388,6 +440,34 @@ Tensor CudaElementAdd(const Tensor& a, const Tensor& b, int device_id) {
     y_dev.Download(y.data.data(), y.Size() * sizeof(float));
     return y;
 }
+CudaTensor CudaElementAddDeviceWeight(const CudaTensor& a, const void* b_data, const std::vector<int>& b_shape, int device_id) {
+    ValidateAddDeviceWeightInput(a, b_data, b_shape, device_id);
+    CudaSetDevice(device_id);
+
+    CudaTensor y(a.Shape(), device_id);
+    int n = static_cast<int>(a.GetSize());
+
+    ElementAddKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(a.GetData()), static_cast<const float*>(b_data), static_cast<float*>(y.GetData()), n);
+    CheckLastKernelError("ElementAddKernel(a + b_data)");
+
+    return y;
+}
+CudaTensor CudaElementAddDeviceInput(const CudaTensor& a, const CudaTensor& b, int device_id) {
+    RequireSameShape(a, b, "CudaElementAddDeviceInput");
+    if (a.GetDeviceId() != device_id || b.GetDeviceId() != device_id) {
+        throw std::runtime_error("CudaElementAddDeviceInput: two tensor is not on this device");
+    }
+
+    CudaSetDevice(device_id);
+    CudaTensor y(a.Shape(), device_id);
+    int n = a.GetSize();
+
+    ElementAddKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(a.GetData()), static_cast<const float*>(b.GetData()), static_cast<float*>(y.GetData()), n);
+    CheckLastKernelError("ElementAddKernel(a + b)");
+
+    return y;
+}
+
 
 Tensor CudaSoftmax(const Tensor& x, int device_id) {
     Check1D(x, "CudaSoftmax");
@@ -452,106 +532,6 @@ void CudaRope(Tensor& q, Tensor& k, int pos, float theta, RopeType type, int dev
     }
 }
 
-
-/*
-DeviceWeight
-    输入和 weight 都在 GPU
-    不需要重复拷贝 weight
-    是主 CUDA 前向更适合使用的版本
-
-*/
-CudaTensor CudaRmsNormDeviceWeight(const CudaTensor& x, const void* weight_data, const std::vector<int>& weight_shape, float eps, int device_id) {
-    ValidateRmsNormDeviceWeightInput(x, weight_data, weight_shape, eps, device_id);
-    CudaSetDevice(device_id);
-
-    CudaTensor y(x.Shape(), device_id);
-    CudaDeviceBuffer sum_dev(sizeof(float), device_id);
-    CheckCudaOps(cudaMemset(sum_dev.GetData(), 0, sizeof(float)), "CudaMemset(sum)");
-    int n = static_cast<int>(x.GetSize());
-
-    SumSquareKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(x.GetData()), static_cast<float*>(sum_dev.GetData()), n);
-    CheckLastKernelError("SumSquareKernel(sum)");
-
-    RmsNormKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(x.GetData()), static_cast<const float*>(weight_data), 
-                static_cast<float*>(y.GetData()), static_cast<const float*>(sum_dev.GetData()), n, eps);
-    CheckLastKernelError("RmsNormKernel(x)");
-
-    return y;
-}
-
-CudaTensor CudaElementAddDeviceWeight(const CudaTensor& a, const void* b_data, const std::vector<int>& b_shape, int device_id) {
-    ValidateAddDeviceWeightInput(a, b_data, b_shape, device_id);
-    CudaSetDevice(device_id);
-
-    CudaTensor y(a.Shape(), device_id);
-    int n = static_cast<int>(a.GetSize());
-
-    ElementAddKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(a.GetData()), static_cast<const float*>(b_data), static_cast<float*>(y.GetData()), n);
-    CheckLastKernelError("ElementAddKernel(a + b_data)");
-
-    return y;
-}
-
-/*
-DeviceInput
-    输入 x 在 GPU
-    weight 仍在 CPU
-    每次把 weight 上传到 GPU
-*/
-CudaTensor CudaRmsNormDeviceInput(const CudaTensor& x, const Tensor& weight, float eps, int device_id) {
-    ValidateRmsNormDeviceWeightInput(x, weight.data.data(), weight.shape, eps, device_id);
-    CudaSetDevice(device_id);
-    CudaDeviceBuffer w_dev(weight.Size() * sizeof(float), device_id);
-    w_dev.Upload(weight.data.data(), weight.Size() * sizeof(float));
-    return CudaRmsNormDeviceWeight(x, w_dev.GetData(), weight.shape, eps, device_id);
-}
-
-CudaTensor CudaSiluDeviceInput(const CudaTensor& x, int device_id) {
-    if (x.GetDeviceId() != device_id) {
-        throw std::runtime_error("CudaSiluDeviceInput: this tensor device is not this device");
-    }
-    CudaSetDevice(device_id);
-    CudaTensor y(x.Shape(), device_id);
-    int n = static_cast<int>(x.GetSize());
-
-    SiluKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(x.GetData()), static_cast<float*>(y.GetData()), n);
-    CheckLastKernelError("CudaSiluDeviceInput");
-
-    return y;
-}
-
-CudaTensor CudaElementAddDeviceInput(const CudaTensor& a, const CudaTensor& b, int device_id) {
-    RequireSameShape(a, b, "CudaElementAddDeviceInput");
-    if (a.GetDeviceId() != device_id || b.GetDeviceId() != device_id) {
-        throw std::runtime_error("CudaElementAddDeviceInput: two tensor is not on this device");
-    }
-
-    CudaSetDevice(device_id);
-    CudaTensor y(a.Shape(), device_id);
-    int n = a.GetSize();
-
-    ElementAddKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(a.GetData()), static_cast<const float*>(b.GetData()), static_cast<float*>(y.GetData()), n);
-    CheckLastKernelError("ElementAddKernel(a + b)");
-
-    return y;
-}
-
-CudaTensor CudaElementMutmulDeviceInput(const CudaTensor& a, const CudaTensor& b, int device_id) {
-    RequireSameShape(a, b, "CudaElementMutmulDeviceInput");
-    if (a.GetDeviceId() != device_id || b.GetDeviceId() != device_id) {
-        throw std::runtime_error("CudaElementMutmulDeviceInput: two tensor is not on this device");
-    }
-
-    CudaSetDevice(device_id);
-    CudaTensor y(a.Shape(), device_id);
-    int n = a.GetSize();
-
-    ElementMulmutKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(a.GetData()), static_cast<const float*>(b.GetData()), static_cast<float*>(y.GetData()), n);
-    CheckLastKernelError("ElementMulmutKernel(a * b)");
-
-    return y;  
-}
-
 void CudaRopeDeviceInput(CudaTensor& q, CudaTensor& k, int n_heads, int n_kv_heads, int head_dim, int pos, float theta, RopeType type, int device_id) {
     ValidateRopeDeviceInput(q, k, pos, theta, n_heads, n_kv_heads, head_dim, device_id);
     CudaSetDevice(device_id);
@@ -570,6 +550,5 @@ void CudaRopeDeviceInput(CudaTensor& q, CudaTensor& k, int n_heads, int n_kv_hea
         CheckLastKernelError("RopeNormalKernel(k)");
     }
 }
-
 
 }

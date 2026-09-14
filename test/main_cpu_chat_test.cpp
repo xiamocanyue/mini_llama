@@ -242,7 +242,6 @@ int RunCpuDemo(const CpuDemoPath& demo) {
     return 0;
 }
 
-
 }  // namespace
 
 } 

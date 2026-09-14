@@ -2,7 +2,7 @@
 
 #include "include/kv_cache.h"
 #include "include/model.h"
-//#include "include/cuda_kv_cache.h"
+#include "include/cuda_kv_cache.h"
 
 namespace mini_llama {
 
@@ -16,13 +16,14 @@ struct MiniLlamaContext {
     MiniLlamaContext& operator=(MiniLlamaContext&&) noexcept = default;
 
     const MiniLlamaModel* model{nullptr};
-    KVCache kv_cache;
+
     std::vector<float> rope_cos;
     std::vector<float> rope_sin;
     std::vector<float> attention_scores;
     std::vector<float> attention_probs;
-    //CudaKVCache cuda_kv_cache_;
-
+    
+    KVCache kv_cache;
+	CudaKVCache cuda_kv_cache_;
     //pos用来定位当前处理的token在上下文中的绝对位置
     //定位kv_cache中的写入位置
     //定位RoPE的位置编码
