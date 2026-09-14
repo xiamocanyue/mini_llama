@@ -250,6 +250,10 @@ int RunCpuDemo(const CpuDemoPath& demo) {
 } 
 
 int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::cerr << "Usage: " << argv[0] << " tiny|gguf\n";
+        return 1;
+    }
     std::string mode = argv[1];
     mini_llama::CpuDemoPath gguf_demo = {
         "tiny-gguf",
@@ -270,11 +274,16 @@ int main(int argc, char** argv) {
         false,
     };
 
-    if (mode == "tiny") {
-        return mini_llama::RunCpuDemo(tiny_demo);
-    }
-    if (mode == "gguf") {
-        return mini_llama::RunCpuDemo(gguf_demo);
+    try {
+        if (mode == "tiny") {
+            return mini_llama::RunCpuDemo(tiny_demo);
+        }
+        if (mode == "gguf") {
+            return mini_llama::RunCpuDemo(gguf_demo);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "CPU generate test failed: " << e.what() << "\n";
+        return 1;
     }
 
     std::cerr << "Unknown mode: " << mode << "\n";

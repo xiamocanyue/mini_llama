@@ -227,7 +227,7 @@ Tensor CudaAttentionDecode(const Tensor& q, const CudaKVCache& kv_cache, int lay
 }
 
 CudaTensor CudaAttentionDecodeDeviceInputs(const CudaTensor& q, const CudaKVCache& kv_cache, int layer, 
-					int pos, int n_heads, int max_seq_len, int n_kv_heads, int head_dim, int device_id) {
+					int pos, int max_seq_len, int n_heads, int n_kv_heads, int head_dim, int device_id) {
 	
 	ValidateAttentionDeviceInputs(q, kv_cache, layer, pos, n_heads, n_kv_heads, head_dim, device_id);
 	CudaSetDevice(device_id);

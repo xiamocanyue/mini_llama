@@ -281,7 +281,7 @@ static void ApplyQuantOverride(MiniLlamaModel& model,
 static Tensor RunLogitsForTokens(const MiniLlamaModel& model,
                                  const std::vector<int>& tokens) {
   MiniLlamaContext ctx(&model);
-  MiniBatch batch = MiniBatch::FromTokens(tokens, 0);
+  MiniBatch batch = MiniBatch::GetMultiMiniBatch(tokens, 0);
   return ForwardBatch(ctx, model, batch);
 }
 
@@ -289,17 +289,17 @@ static std::pair<float, float> LogitsError(const Tensor& baseline,
                                            const Tensor& candidate) {
   if (baseline.shape != candidate.shape) {
     throw std::runtime_error(
-        "LogitsError: shape mismatch, baseline=" + baseline.ShapeStringShort() +
-        ", candidate=" + candidate.ShapeStringShort());
+        "LogitsError: shape mismatch, baseline=" + baseline.ShapeString() +
+        ", candidate=" + candidate.ShapeString());
   }
   float max_err = 0.0f;
   float sum_err = 0.0f;
-  for (size_t i = 0; i < baseline.size(); ++i) {
+  for (size_t i = 0; i < baseline.Size(); ++i) {
     float err = std::abs(baseline.data[i] - candidate.data[i]);
     max_err = std::max(max_err, err);
     sum_err += err;
   }
-  return {max_err, sum_err / static_cast<float>(baseline.size())};
+  return {max_err, sum_err / static_cast<float>(baseline.Size())};
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +469,7 @@ static LoadedModel LoadModelAndTokenizer(
 
   if (is_gguf) {
     result.model = LoadGgufModel(model_path);
-    if (!result.model.loaded) {
+    if (!result.model.is_loaded) {
       return result;
     }
 
@@ -496,7 +496,7 @@ static LoadedModel LoadModelAndTokenizer(
     }
 
     // 3. Load chat template from GGUF metadata (M14)
-    result.chat_template = LoadChatTemplateFromGguf(model_path);
+    result.chat_template = LoadChatTemplateFromGGUF(model_path);
   } else {
     // Directory-based JSON+BIN format
     if (std::filesystem::is_directory(path)) {
@@ -512,7 +512,7 @@ static LoadedModel LoadModelAndTokenizer(
       }
     }
     result.model = LoadModel(config_path, model_path);
-    if (!result.model.loaded) {
+    if (!result.model.is_loaded) {
       return result;
     }
     if (!explicit_tokenizer_path.empty()) {
@@ -536,7 +536,7 @@ static LoadedModel LoadModelAndTokenizer(
 
   if (!result.tokenizer) {
     result.model.load_error = "Failed to load tokenizer";
-    result.model.loaded = false;
+    result.model.is_loaded = false;
     return result;
   }
 
@@ -680,9 +680,9 @@ static int RunGenerate(int argc, char** argv) {
   auto stage_start = RequestClock::now();
   LoadedModel lm = LoadModelAndTokenizer(
       model_path, config_path_set ? config_path : "", tokenizer_path);
-  request.model_load_ms = ElapsedMs(stage_start);
+  request.model_load_ms = GetUseTime(stage_start);
   request.RecordEvent("model_load", request.model_load_ms, 0, model_path);
-  if (!lm.model.loaded) {
+  if (!lm.model.is_loaded) {
     request.SetError("Failed to load model: " + lm.model.load_error);
     request.Finish();
     PrintRequestTrace(request, std::cerr);
@@ -696,9 +696,9 @@ static int RunGenerate(int argc, char** argv) {
     std::cerr << request.error << "\n";
     return 1;
   }
-  if (lm.model.config.vocab_size < lm.tokenizer->vocab_size()) {
+  if (lm.model.config.vocab_size < lm.tokenizer->GetVocabSize()) {
     request.SetError("Model vocab_size must be at least " +
-                     std::to_string(lm.tokenizer->vocab_size()) +
+                     std::to_string(lm.tokenizer->GetVocabSize()) +
                      " for the tokenizer.");
     request.Finish();
     PrintRequestTrace(request, std::cerr);
@@ -709,7 +709,7 @@ static int RunGenerate(int argc, char** argv) {
   try {
     stage_start = RequestClock::now();
     ApplyQuantOverride(model, quant_type);
-    request.RecordEvent("quantize", ElapsedMs(stage_start), 0,
+    request.RecordEvent("quantize", GetUseTime(stage_start), 0,
                         quant_type.empty() ? "model-native" : quant_type);
   } catch (const std::exception& e) {
     request.SetError("Quantization failed: " + std::string(e.what()));
@@ -727,9 +727,9 @@ static int RunGenerate(int argc, char** argv) {
   std::unique_ptr<ITokenizer>& tokenizer = lm.tokenizer;
   stage_start = RequestClock::now();
   std::vector<int> tokens = tokenizer->Encode(prompt);
-  request.tokenize_ms = ElapsedMs(stage_start);
+  request.tokenizer_ms = GetUseTime(stage_start);
   request.prompt_tokens = static_cast<int>(tokens.size());
-  request.RecordEvent("tokenize", request.tokenize_ms, request.prompt_tokens,
+  request.RecordEvent("tokenize", request.tokenizer_ms, request.prompt_tokens,
                       "prompt");
   std::cout << "prompt: " << prompt << "\n";
   std::cout << "tokens: [";
@@ -769,7 +769,7 @@ static int RunGenerate(int argc, char** argv) {
   }
 
   MiniLlamaContext ctx(&model);
-  SamplingParams sampling_params;
+  SamplerParams sampling_params;
   sampling_params.temperature = temperature;
   sampling_params.top_k = top_k;
   sampling_params.seed = seed;
@@ -784,7 +784,7 @@ static int RunGenerate(int argc, char** argv) {
     if (!dump_logits_dir.empty()) {
       for (size_t i = 0; i < prompt_len; ++i) {
         MiniBatch prefill_step =
-            MiniBatch::FromTokens({tokens[i]}, static_cast<int>(i));
+            MiniBatch::GetMultiMiniBatch({tokens[i]}, static_cast<int>(i));
         logits = ForwardBatch(ctx, model, prefill_step);
         ++ctx.n_prefill_tokens;
         DumpLogits(logits, dump_logits_dir + "/logits_step" +
@@ -792,11 +792,11 @@ static int RunGenerate(int argc, char** argv) {
         ++step;
       }
     } else {
-      MiniBatch prefill = MiniBatch::FromTokens(tokens, 0);
+      MiniBatch prefill = MiniBatch::GetMultiMiniBatch(tokens, 0);
       logits = ForwardBatch(ctx, model, prefill);
       ctx.n_prefill_tokens += static_cast<int>(tokens.size());
     }
-    request.prefill_ms = ElapsedMs(stage_start);
+    request.prefill_ms = GetUseTime(stage_start);
     request.prefill_tokens = static_cast<int>(prompt_len);
     request.RecordEvent("prefill", request.prefill_ms, request.prefill_tokens,
                         dump_logits_dir.empty() ? "batch" : "step_dump");
@@ -804,16 +804,16 @@ static int RunGenerate(int argc, char** argv) {
     if (n_predict > 0) {
       stage_start = RequestClock::now();
       int next_token = sampler.Sample(logits, sampling_params);
-      request.sample_ms += ElapsedMs(stage_start);
+      request.sample_ms += GetUseTime(stage_start);
       tokens.push_back(next_token);
 
       std::cout << "decode loop...\n";
       for (int i = 1; i < n_predict; ++i) {
-        MiniBatch decode_batch = MiniBatch::Single(
+        MiniBatch decode_batch = MiniBatch::GetSingleMiniBatch(
             tokens.back(), static_cast<int>(tokens.size() - 1));
         stage_start = RequestClock::now();
         logits = ForwardBatch(ctx, model, decode_batch);
-        double decode_ms = ElapsedMs(stage_start);
+        double decode_ms = GetUseTime(stage_start);
         request.decode_ms += decode_ms;
         request.RecordEvent("decode", decode_ms, 1,
                             "pos=" + std::to_string(tokens.size() - 1));
@@ -826,9 +826,9 @@ static int RunGenerate(int argc, char** argv) {
         }
         stage_start = RequestClock::now();
         next_token = sampler.Sample(logits, sampling_params);
-        request.sample_ms += ElapsedMs(stage_start);
+        request.sample_ms += GetUseTime(stage_start);
         tokens.push_back(next_token);
-        if (next_token == tokenizer->eos_id()) {
+        if (next_token == tokenizer->GetEOSId()) {
           break;
         }
       }
@@ -979,7 +979,7 @@ static int RunChat(int argc, char** argv) {
 
   // Load model
   LoadedModel lm = LoadModelAndTokenizer(model_dir, "", tokenizer_path);
-  if (!lm.model.loaded) {
+  if (!lm.model.is_loaded) {
     std::cerr << "Failed to load model: " << lm.model.load_error << "\n";
     return 1;
   }
@@ -987,9 +987,9 @@ static int RunChat(int argc, char** argv) {
     std::cerr << "Failed to load tokenizer.\n";
     return 1;
   }
-  if (lm.model.config.vocab_size < lm.tokenizer->vocab_size()) {
+  if (lm.model.config.vocab_size < lm.tokenizer->GetVocabSize()) {
     std::cerr << "Model vocab_size must be at least "
-              << lm.tokenizer->vocab_size() << " for the tokenizer.\n";
+              << lm.tokenizer->GetVocabSize() << " for the tokenizer.\n";
     return 1;
   }
 
@@ -1005,9 +1005,9 @@ static int RunChat(int argc, char** argv) {
   }
   Terminal term;
   ChatSession session;
-  session.sampling_params.temperature = temperature;
-  session.sampling_params.top_k = top_k;
-  session.sampling_params.seed = seed;
+  session.sampler_params_.temperature = temperature;
+  session.sampler_params_.top_k = top_k;
+  session.sampler_params_.seed = seed;
 
   // Plain text mode keeps the default system message in session state.
   if (lm.chat_template.empty()) {
@@ -1102,7 +1102,7 @@ static int RunChat(int argc, char** argv) {
       continue;
     }
     if (input == "/params") {
-      term.PrintParams(session.sampling_params);
+      term.PrintParams(session.sampler_params_);
       continue;
     }
     if (!input.empty() && input[0] == '/') {
@@ -1116,19 +1116,19 @@ static int RunChat(int argc, char** argv) {
     RequestContext request =
         StartRequest("run", BackendKindName(backend_config.kind), model_dir);
 
-    std::vector<ChatMessage> candidate_messages = session.messages;
+    std::vector<ChatMessage> candidate_messages = session.messages_;
     candidate_messages.push_back({"user", input});
 
     auto stage_start = RequestClock::now();
     std::string prompt_text = builder.Build(candidate_messages);
-    request.RecordEvent("prompt_build", ElapsedMs(stage_start), 0,
+    request.RecordEvent("prompt_build", GetUseTime(stage_start), 0,
                         "messages=" +
                             std::to_string(candidate_messages.size()));
     stage_start = RequestClock::now();
     std::vector<int> tokens = tokenizer->Encode(prompt_text);
-    request.tokenize_ms = ElapsedMs(stage_start);
+    request.tokenizer_ms = GetUseTime(stage_start);
     request.prompt_tokens = static_cast<int>(tokens.size());
-    request.RecordEvent("tokenize", request.tokenize_ms, request.prompt_tokens,
+    request.RecordEvent("tokenize", request.tokenizer_ms, request.prompt_tokens,
                         "prompt");
 
     if (tokens.size() >= static_cast<size_t>(model.config.max_seq_len)) {
@@ -1148,13 +1148,13 @@ static int RunChat(int argc, char** argv) {
       max_response = max_response_tokens;
     }
 
-    session.messages = candidate_messages;
-    MiniSampler sampler(session.sampling_params);
+    session.messages_ = candidate_messages;
+    MiniSampler sampler(session.sampler_params_);
     Tensor logits;
 
     auto start = std::chrono::steady_clock::now();
 
-    size_t cached_prefix_len = session.LongestCachedPrefix(tokens);
+    size_t cached_prefix_len = session.GetLongestCachePrefix(tokens);
     size_t context_prefix_len = CommonPrefixLength(ctx.token_history, tokens);
     size_t prefix_len = std::min(cached_prefix_len, context_prefix_len);
     if (prefix_len >= tokens.size()) {
@@ -1172,11 +1172,11 @@ static int RunChat(int argc, char** argv) {
 
     // Prefill only the context suffix that is missing from KV cache.
     {
-      MiniBatch prefill = MiniBatch::FromTokens(new_prompt_tokens,
-                                                static_cast<int>(prefix_len));
+      MiniBatch prefill = MiniBatch::GetMultiMiniBatch(
+          new_prompt_tokens, static_cast<int>(prefix_len));
       stage_start = RequestClock::now();
       logits = ForwardBatch(ctx, model, prefill);
-      request.prefill_ms = ElapsedMs(stage_start);
+      request.prefill_ms = GetUseTime(stage_start);
       request.prefill_tokens = static_cast<int>(new_prompt_tokens.size());
       request.RecordEvent(
           "prefill", request.prefill_ms, request.prefill_tokens,
@@ -1194,13 +1194,13 @@ static int RunChat(int argc, char** argv) {
     try {
       for (int i = 0; i < max_response; ++i) {
         stage_start = RequestClock::now();
-        int next_token = sampler.Sample(logits, session.sampling_params);
-        request.sample_ms += ElapsedMs(stage_start);
+        int next_token = sampler.Sample(logits, session.sampler_params_);
+        request.sample_ms += GetUseTime(stage_start);
         tokens.push_back(next_token);
         session.AppendToken(next_token);
         ++generated_count;
 
-        if (next_token != tokenizer->eos_id()) {
+        if (next_token != tokenizer->GetEOSId()) {
           generated_ids.push_back(next_token);
           std::string current_reply = tokenizer->Decode(generated_ids);
           if (current_reply.size() > streamed_reply.size()) {
@@ -1211,16 +1211,17 @@ static int RunChat(int argc, char** argv) {
         }
 
         MiniBatch decode_batch =
-            MiniBatch::Single(next_token, static_cast<int>(tokens.size() - 1));
+            MiniBatch::GetSingleMiniBatch(
+                next_token, static_cast<int>(tokens.size() - 1));
         stage_start = RequestClock::now();
         logits = ForwardBatch(ctx, model, decode_batch);
-        double decode_ms = ElapsedMs(stage_start);
+        double decode_ms = GetUseTime(stage_start);
         request.decode_ms += decode_ms;
         request.RecordEvent("decode", decode_ms, 1,
                             "pos=" + std::to_string(tokens.size() - 1));
         ++ctx.n_decode_tokens;
         ++request.decode_tokens;
-        if (next_token == tokenizer->eos_id()) {
+        if (next_token == tokenizer->GetEOSId()) {
           break;
         }
       }
@@ -1246,12 +1247,12 @@ static int RunChat(int argc, char** argv) {
         std::chrono::duration<double, std::milli>(end - start).count();
 
     session.AddMessage("assistant", assistant_reply);
-    session.RecordTurn(static_cast<int>(new_prompt_tokens.size()),
-                       generated_count, elapsed_ms);
+    session.Record(static_cast<int>(new_prompt_tokens.size()), generated_count,
+                   elapsed_ms);
     request.generated_tokens = generated_count;
     request.RecordEvent("sample", request.sample_ms, request.generated_tokens,
                         "generated_tokens");
-    session.RecordPrefix(session.token_history);
+    session.RecordPrefix(session.token_history_);
     request.Finish();
     PrintRequestTrace(request);
   }
@@ -1281,10 +1282,10 @@ static void PrintGlobalUsage(const char* prog) {
 
 static int RunCudaInfo() {
   try {
-    int count = CudaDeviceCount();
+    int count = GetCudaDeviceCount();
     std::cout << "CUDA devices: " << count << "\n";
     for (int device_id = 0; device_id < count; ++device_id) {
-      CudaDeviceInfo info = CudaGetDeviceInfo(device_id);
+      CudaDeviceInfo info = GetCudaDeviceInfo(device_id);
       double total_gb = static_cast<double>(info.total_memory_bytes) /
                         (1024.0 * 1024.0 * 1024.0);
       std::cout << "device " << info.id << ": " << info.name << "\n"
@@ -1343,6 +1344,58 @@ static MiniLlamaModel LoadModelForInspect(const std::string& path) {
   return LoadModel(config_path, model_path);
 }
 
+static bool InspectManifest(const std::string& config_path) {
+  ModelManifest manifest;
+  try {
+    manifest = ParseManifest(config_path);
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to inspect model: " << e.what() << "\n";
+    return false;
+  }
+
+  const ModelConfig& config = manifest.config;
+  std::cout << "=== Model Config ===\n"
+            << "  vocab_size:    " << config.vocab_size << "\n"
+            << "  dim:           " << config.dim << "\n"
+            << "  hidden_dim:    " << config.hidden_dim << "\n"
+            << "  n_layers:      " << config.n_layers << "\n"
+            << "  n_heads:       " << config.n_heads << "\n"
+            << "  n_kv_heads:    " << config.n_kv_heads << "\n"
+            << "  head_dim:      " << config.head_dim << "\n"
+            << "  max_seq_len:   " << config.max_seq_len << "\n"
+            << "  rope_theta:    " << config.rope_theta << "\n"
+            << "  rms_norm_eps:  " << config.rms_norm_eps << "\n\n";
+
+  std::cout << "=== Tensors (" << manifest.tensor_infos.size() << ") ===\n";
+  size_t total_bytes = 0;
+  for (const TensorInfo& tensor : manifest.tensor_infos) {
+    std::cout << "  " << tensor.name << "\n    shape:     [";
+    for (size_t i = 0; i < tensor.shape.size(); ++i) {
+      if (i > 0) {
+        std::cout << ", ";
+      }
+      std::cout << tensor.shape[i];
+    }
+    std::cout << "]\n"
+              << "    dtype:     " << tensor.data_type << "\n"
+              << "    offset:    " << tensor.offset << "\n"
+              << "    byte_size: " << tensor.byte_size << "\n";
+    total_bytes += tensor.byte_size;
+  }
+
+  std::cout << "\n=== Tokenizer ===\n"
+            << "  type: " << manifest.tokenizer.type << "\n"
+            << "  path: "
+            << (manifest.tokenizer.path.empty() ? "<none>"
+                                                 : manifest.tokenizer.path)
+            << "\n"
+            << "  bos_id: " << manifest.tokenizer.bos_id << "\n"
+            << "  eos_id: " << manifest.tokenizer.eos_id << "\n"
+            << "  unk_id: " << manifest.tokenizer.unk_id << "\n\n"
+            << "Total tensor bytes: " << total_bytes << "\n";
+  return true;
+}
+
 static int RunInspect(int argc, char** argv) {
   if (argc >= 3 && (std::strcmp(argv[2], "-h") == 0 ||
                     std::strcmp(argv[2], "--help") == 0)) {
@@ -1389,13 +1442,13 @@ static int RunInspect(int argc, char** argv) {
     std::filesystem::path config_path =
         std::filesystem::path(model_path) / "model.json";
     if (std::filesystem::exists(config_path) &&
-        !mini_llama::InspectModel(config_path.string())) {
+        !InspectManifest(config_path.string())) {
       return 1;
     }
   }
 
   MiniLlamaModel model = LoadModelForInspect(model_path);
-  if (!model.loaded) {
+  if (!model.is_loaded) {
     std::cerr << "Failed to load model: " << model.load_error << "\n";
     return 1;
   }
@@ -1562,7 +1615,7 @@ static int RunBench(int argc, char** argv) {
   }
 
   LoadedModel lm = LoadModelAndTokenizer(model_dir, "", tokenizer_path);
-  if (!lm.model.loaded) {
+  if (!lm.model.is_loaded) {
     std::cerr << "Failed to load model: " << lm.model.load_error << "\n";
     return 1;
   }
@@ -1570,9 +1623,9 @@ static int RunBench(int argc, char** argv) {
     std::cerr << "Failed to load tokenizer.\n";
     return 1;
   }
-  if (lm.model.config.vocab_size < lm.tokenizer->vocab_size()) {
+  if (lm.model.config.vocab_size < lm.tokenizer->GetVocabSize()) {
     std::cerr << "Model vocab_size must be at least "
-              << lm.tokenizer->vocab_size() << " for the tokenizer.\n";
+              << lm.tokenizer->GetVocabSize() << " for the tokenizer.\n";
     return 1;
   }
 

@@ -22,34 +22,34 @@ bool CheckCudaOpsBuild() {
 #ifndef MINI_LLAMA_USE_CUDA
 
 //逐元素处理
-Tensor CudaElementMutmul(const Tensor& a, const Tensor& b, int device_id = 0) {
+Tensor CudaElementMutmul(const Tensor& a, const Tensor& b, int device_id) {
     (void)a;
     (void)b;
     (void)device_id;
     throw CudaNotBuiltOps();
 }
 
-CudaTensor CudaElementMutmulDeviceInput(const CudaTensor& a, const CudaTensor& b, int device_id = 0) {
+CudaTensor CudaElementMutmulDeviceInput(const CudaTensor& a, const CudaTensor& b, int device_id) {
     (void)a;
     (void)b;
     (void)device_id;
     throw CudaNotBuiltOps();
 }
 
-Tensor CudaElementAdd(const Tensor& a, const Tensor& b, int device_id = 0) {
+Tensor CudaElementAdd(const Tensor& a, const Tensor& b, int device_id) {
     (void)a;
     (void)b;
     (void)device_id;
     throw CudaNotBuiltOps();
 }
-CudaTensor CudaElementAddDeviceInput(const CudaTensor& a, const CudaTensor& b, int device_id = 0) {
+CudaTensor CudaElementAddDeviceInput(const CudaTensor& a, const CudaTensor& b, int device_id) {
     (void)a;
     (void)b;
     (void)device_id;
     throw CudaNotBuiltOps();  
 }
 
-CudaTensor CudaElementAddDeviceWeight(const CudaTensor& a, const void* b_data, const std::vector<int>& b_shape, int device_id = 0) {
+CudaTensor CudaElementAddDeviceWeight(const CudaTensor& a, const void* b_data, const std::vector<int>& b_shape, int device_id) {
     (void)a;
     (void)b_data;
     (void)b_shape;
@@ -57,34 +57,26 @@ CudaTensor CudaElementAddDeviceWeight(const CudaTensor& a, const void* b_data, c
     throw CudaNotBuiltOps();
 }
 
-Tensor CudaSilu(const Tensor& x, int device_id = 0) {
+Tensor CudaSilu(const Tensor& x, int device_id) {
     (void)x;
     (void)device_id;
     throw CudaNotBuiltOps();
 }
 
-CudaTensor CudaSiluDeviceInput(const CudaTensor& x, int device_id = 0) {
+CudaTensor CudaSiluDeviceInput(const CudaTensor& x, int device_id) {
     (void)x;
     (void)device_id;
     throw CudaNotBuiltOps();
 }
 
 
-Tensor CudaSoftmax(const Tensor& x, int device_id = 0) {
+Tensor CudaSoftmax(const Tensor& x, int device_id) {
     (void)x;
     (void)device_id;
     throw CudaNotBuiltOps();
 }
 
-Tensor CudaRmsNorm(const Tensor& x, const Tensor& weight, float eps, int device_id = 0) {
-    (void)x;
-    (void)weight;
-    (void)eps;
-    (void)device_id;
-    throw CudaNotBuiltOps();
-}
-
-CudaTensor CudaRmsNormDeviceInput(const CudaTensor& x, const Tensor& weight, float eps, int device_id = 0) {
+Tensor CudaRmsNorm(const Tensor& x, const Tensor& weight, float eps, int device_id) {
     (void)x;
     (void)weight;
     (void)eps;
@@ -92,7 +84,15 @@ CudaTensor CudaRmsNormDeviceInput(const CudaTensor& x, const Tensor& weight, flo
     throw CudaNotBuiltOps();
 }
 
-CudaTensor CudaRmsNormDeviceWeight(const CudaTensor& x, const void* weight_data, const std::vector<int>& weight_shape, float eps, int device_id = 0) {
+CudaTensor CudaRmsNormDeviceInput(const CudaTensor& x, const Tensor& weight, float eps, int device_id) {
+    (void)x;
+    (void)weight;
+    (void)eps;
+    (void)device_id;
+    throw CudaNotBuiltOps();
+}
+
+CudaTensor CudaRmsNormDeviceWeight(const CudaTensor& x, const void* weight_data, const std::vector<int>& weight_shape, float eps, int device_id) {
     (void)x;
     (void)weight_data;
     (void)weight_shape;
@@ -101,7 +101,7 @@ CudaTensor CudaRmsNormDeviceWeight(const CudaTensor& x, const void* weight_data,
     throw CudaNotBuiltOps();
 }
 
-void CudaRope(Tensor& q, Tensor& k, int pos, float theta, RopeType type = RopeType::kNormal, int device_id = 0) {
+void CudaRope(Tensor& q, Tensor& k, int pos, float theta, RopeType type, int device_id) {
     (void)q;
     (void)k;
     (void)pos;
@@ -112,7 +112,7 @@ void CudaRope(Tensor& q, Tensor& k, int pos, float theta, RopeType type = RopeTy
 }
 
 void CudaRopeDeviceInput(CudaTensor& q, CudaTensor& k, int n_heads, int n_kv_heads, int head_dim,
-                int pos, float theta, RopeType type = RopeType::kNormal, int device_id = 0) {
+						int pos, float theta, RopeType type, int device_id) {
     (void)q;
     (void)k;
     (void)n_heads;
@@ -125,7 +125,7 @@ void CudaRopeDeviceInput(CudaTensor& q, CudaTensor& k, int n_heads, int n_kv_hea
     throw CudaNotBuiltOps();
 }
 
-CudaTensor CudaEmbedding(const void* embedding_data, const std::vector<int>& embedding_shape, int token_id, int device_id = 0) {
+CudaTensor CudaEmbedding(const void* embedding_data, const std::vector<int>& embedding_shape, int token_id, int device_id) {
     (void)embedding_data;
     (void)embedding_shape;
     (void)token_id;

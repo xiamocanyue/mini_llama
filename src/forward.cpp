@@ -455,6 +455,7 @@ void ForwardRope(const MiniLlamaModel& model, MiniLlamaContext& ctx, Tensor& q, 
                  int pos, float theta, RopeType type) {
 	if (!CheckHaveGpu(model)) {
 		RoPE(q, k, pos, ctx.rope_cos, ctx.rope_sin, type);
+		return ;
 	}
 	CudaRope(q, k, pos, theta, type, GetCudaDeviceId(model));
 	RecordCudaActivationCall(model);

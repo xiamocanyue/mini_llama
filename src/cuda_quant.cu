@@ -17,7 +17,7 @@ namespace {
 constexpr int kBlockSize = 128;
 
 int GetBlockNum(int n, int block_size) {
-    return (n + kBlockSize - 1) / kBlockSize;
+    return (n + block_size - 1) / block_size;
 }
   
 void CheckCudaQuant(cudaError_t err, const char* caller) {
@@ -47,7 +47,7 @@ __global__ void Q80LinearKernel(const float* x, const BlockQ80* weight,
 	}
 
 	const float* x_row = x + static_cast<size_t>(row) * in_features;
-	const BlockQ80* w_row = weight + static_cast<size_t>(row) * blocks_per_row;
+	const BlockQ80* w_row = weight + static_cast<size_t>(out) * blocks_per_row;
 	float sum = 0.0f;
 
 	for (int block_index = 0; block_index < blocks_per_row; block_index++) {
@@ -88,7 +88,7 @@ __global__ void Q40LinearKernel(const float* x, const BlockQ40* weight,
 	}
 
 	const float* x_row = x + static_cast<size_t>(row) * in_features;
-	const BlockQ40* w_row = weight + static_cast<size_t>(row) * blocks_per_row;
+	const BlockQ40* w_row = weight + static_cast<size_t>(out) * blocks_per_row;
 	float sum = 0.0f;
 
 	for (int block_index = 0; block_index < blocks_per_row; block_index++) {
@@ -116,7 +116,7 @@ __global__ void Q41LinearKernel(const float* x, const BlockQ41* weight,
 	}
 
 	const float* x_row = x + static_cast<size_t>(row) * in_features;
-	const BlockQ41* w_row = weight + static_cast<size_t>(row) * blocks_per_row;
+	const BlockQ41* w_row = weight + static_cast<size_t>(out) * blocks_per_row;
 	float sum = 0.0f;
 
 	for (int block_index = 0; block_index < blocks_per_row; block_index++) {

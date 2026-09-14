@@ -16,12 +16,14 @@ bool CheckCudaAttentionBuilt() {
 }
 
 #ifndef MINI_LLAMA_USE_CUDA
-Tensor CudaAttentionDecode(const Tensor& q, const CudaKvCache& kv_cache, int layer, 
-					int pos, int n_heads, int n_kv_heads, int head_dim, int device_id) {
+Tensor CudaAttentionDecode(const Tensor& q, const CudaKVCache& kv_cache, int layer,
+						int pos, int max_seq_len, int n_heads, int n_kv_heads,
+						int head_dim, int device_id) {
 	(void)q;
 	(void)kv_cache;
 	(void)layer;
 	(void)pos;
+	(void)max_seq_len;
 	(void)n_heads;
 	(void)n_kv_heads;
 	(void)head_dim;
@@ -29,12 +31,15 @@ Tensor CudaAttentionDecode(const Tensor& q, const CudaKvCache& kv_cache, int lay
 	throw CudaAttentionNotBuilt();
 }
 
-CudaTensor CudaAttentionDecodeDeviceInputs(const CudaTensor& q, const CudaKvCache& kv_cache, int layer, 
-					int pos, int n_heads, int n_kv_heads, int head_dim, int device_id) {
+CudaTensor CudaAttentionDecodeDeviceInputs(const CudaTensor& q,
+						const CudaKVCache& kv_cache, int layer, int pos,
+						int max_seq_len, int n_heads, int n_kv_heads,
+						int head_dim, int device_id) {
 	(void)q;
 	(void)kv_cache;
 	(void)layer;
 	(void)pos;
+	(void)max_seq_len;
 	(void)n_heads;
 	(void)n_kv_heads;
 	(void)head_dim;

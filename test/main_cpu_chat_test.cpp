@@ -197,6 +197,9 @@ int RunCpuDemo(const CpuDemoPath& demo) {
 
     // Load model
     CpuDemoModel loaded = LoadCpuDemoModel(demo);
+    if (!ValidateLoadedDemo(demo, loaded)) {
+        return 1;
+    }
     MiniLlamaModel& model = loaded.model;
     ITokenizer& tokenizer = *loaded.tokenizer;
     std::cout << "tokenizer:\n"
@@ -226,7 +229,9 @@ int RunCpuDemo(const CpuDemoPath& demo) {
     while (true) {
         prompt.clear();
         std::cout << "开始进行下一条消息" << "user: ";
-        std::cin >> prompt;
+        if (!(std::cin >> prompt)) {
+            break;
+        }
         if (prompt == "/stop") {
             std::cout << "system: stop message,";
             std::cout << "show all message from session" << '\n';
@@ -247,6 +252,10 @@ int RunCpuDemo(const CpuDemoPath& demo) {
 } 
 
 int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::cerr << "Usage: " << argv[0] << " tiny|gguf\n";
+        return 1;
+    }
     std::string mode = argv[1];
     mini_llama::CpuDemoPath gguf_demo = {
         "tiny-gguf",

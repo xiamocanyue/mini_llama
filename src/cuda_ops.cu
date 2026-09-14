@@ -66,13 +66,13 @@ __global__ void GetMaxForSoftmaxKernel(const float* x, float* max_out, int n) {
         max = fmaxf(max, x[i]);
     }
     shared[tid] = max;
-    __syncthreads;
+    __syncthreads();
 
     for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
         }
-        __syncthreads;
+        __syncthreads();
     }
     if (tid == 0) {
         *max_out = shared[0];
@@ -92,13 +92,13 @@ __global__ void GetExpForSoftmaxKernel(const float* x, float* y, const float* ma
         local_sum += e;
     }
     shared[tid] = local_sum;
-    __syncthreads;
+    __syncthreads();
 
     for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             shared[tid] += shared[tid + stride];            
         }
-        __syncthreads;
+        __syncthreads();
     }
     if (tid == 0) {
         *sum_out = shared[0];
@@ -122,13 +122,13 @@ __global__ void RopeNormalKernel(float* x, int n_heads, int head_dim, int pos, f
     int pair_index = blockIdx.x * blockDim.x + threadIdx.x;
     int head_have_pairs = head_dim / 2;
     int total_pairs = n_heads * head_have_pairs;
-    if (pair_index > total_pairs) {
+    if (pair_index >= total_pairs) {
         return ;
     }
 
     int head_index = pair_index / head_have_pairs;
-    int pair_index = pair_index % head_have_pairs;
-    int num_index = pair_index * 2;
+    int pair_in_head = pair_index % head_have_pairs;
+    int num_index = pair_in_head * 2;
     int base = head_index * head_dim + num_index;
 
     float freq = 1.0f / powf(theta, static_cast<float>(num_index) / static_cast<float>(head_dim));
@@ -146,22 +146,22 @@ __global__ void RopeNeoXKernel(float* x, int n_heads, int head_dim, int pos, flo
     int head_have_pairs = head_dim / 2;
     int half_dim = head_have_pairs;
     int total_pairs = n_heads * head_have_pairs;
-    if (pair_index > total_pairs) {
+    if (pair_index >= total_pairs) {
         return ;
     }
 
     int head_index = pair_index / head_have_pairs;
-    int pair_index = pair_index % head_have_pairs;
+    int pair_in_head = pair_index % head_have_pairs;
     int base = head_index * head_dim;
 
-    float freq = 1.0f / powf(theta, static_cast<float>(2 * pair_index) / static_cast<float>(head_dim));
+    float freq = 1.0f / powf(theta, static_cast<float>(2 * pair_in_head) / static_cast<float>(head_dim));
     float cos_val = cosf(static_cast<float>(pos) * freq);
     float sin_val = sinf(static_cast<float>(pos) * freq);
-    float x1 = x[base + pair_index];
-    float x2 = x[base + pair_index + half_dim];
+    float x1 = x[base + pair_in_head];
+    float x2 = x[base + pair_in_head + half_dim];
 
-    x[base + pair_index] = x1 * cos_val - x2 * sin_val;
-    x[base + pair_index + half_dim] = x1 * sin_val + x2 * cos_val;
+    x[base + pair_in_head] = x1 * cos_val - x2 * sin_val;
+    x[base + pair_in_head + half_dim] = x1 * sin_val + x2 * cos_val;
 }
 
 __global__ void EmbeddingLookUpKernel(const float* embedding, float* y, int token_id, int dim) {
@@ -530,6 +530,8 @@ void CudaRope(Tensor& q, Tensor& k, int pos, float theta, RopeType type, int dev
         RopeNeoXKernel<<<GetBlockNum(n_k_pairs), kBlockSize>>>(static_cast<float*>(k_dev.GetData()), n_kv_heads, head_dim, pos, theta);
         CheckLastKernelError("RopeNeoXKernel(k)");
     }
+    q_dev.Download(q.data.data(), q.Size() * sizeof(float));
+    k_dev.Download(k.data.data(), k.Size() * sizeof(float));
 }
 
 void CudaRopeDeviceInput(CudaTensor& q, CudaTensor& k, int n_heads, int n_kv_heads, int head_dim, int pos, float theta, RopeType type, int device_id) {

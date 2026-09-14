@@ -190,7 +190,7 @@ CudaTensor CudaLinearDeviceInputWithDeviceWeight(const CudaTensor& x, const void
 #endif
 } //namespace
 
-bool CheckCudaMatmulBuild() {
+bool CheckCudaMatmulBuilt() {
 #ifdef MINI_LLAMA_USE_CUDA
   return true;
 #else

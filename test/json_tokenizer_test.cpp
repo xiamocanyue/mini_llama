@@ -1,22 +1,35 @@
-#include "include/tokenizer.h"
-
-#include <string>
 #include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "include/tokenizer.h"
 
 using namespace mini_llama;
 
 int main() {
-    JsonTokenizer jt("models/tiny/vocab.json");
-    std::string prompt = "hello world!";
-    std::vector<int> result;
-    result = jt.Encode(prompt);
-    std::cout << "encode result :  " ;
-    for (int n : result) {
-        std::cout << n << " ";
+    try {
+        JsonTokenizer tokenizer("models/tiny/vocab.json");
+        const std::vector<int> expected = {1, 104, 101, 108, 108, 111, 33};
+        const std::vector<int> actual = tokenizer.Encode("hello!");
+        if (actual != expected) {
+            throw std::runtime_error("encoded token sequence mismatch");
+        }
+        if (tokenizer.Decode(actual) != "<bos>hello!") {
+            throw std::runtime_error("decoded text mismatch");
+        }
+        if (tokenizer.DecodeToken(104) != "h" ||
+            tokenizer.DecodeToken(tokenizer.GetUNKId()) != "<unk>") {
+            throw std::runtime_error("single-token decode mismatch");
+        }
+        if (tokenizer.GetVocabSize() != 128 || tokenizer.GetBOSId() != 1 ||
+            tokenizer.GetEOSId() != 2 || tokenizer.GetUNKId() != 0) {
+            throw std::runtime_error("tokenizer metadata mismatch");
+        }
+        std::cout << "json_tokenizer_test: PASS\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "json_tokenizer_test: FAIL: " << error.what() << '\n';
+        return 1;
     }
-    std::cout << std::endl;
-    
-    std::cout << "decode result : " << jt.Decode(result) << std::endl;
-
-    return 0;
 }

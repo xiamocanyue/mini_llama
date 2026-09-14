@@ -19,8 +19,8 @@ u_int16_t FloatToFp16(float value) {
     std::memcpy(&bits, &value, sizeof(bits));
 
     u_int32_t sign = (bits >> 16) & 0x8000u;
-    u_int32_t exponent = static_cast<int>((bits >> 23) & 0xffu) - 127 + 15;
-    u_int32_t mantissa = bits & 0x7ffffu;
+    int32_t exponent = static_cast<int>((bits >> 23) & 0xffu) - 127 + 15;
+    u_int32_t mantissa = bits & 0x7fffffu;
 
     if (exponent <= 0) {
         if (exponent < -10) {
@@ -37,9 +37,9 @@ u_int16_t FloatToFp16(float value) {
         //指数位全为1，尾数全为0，为无穷大
         return static_cast<u_int16_t>(sign | 0x7c00u);
     }
-    if ((mantissa & 0x00001000u) == 1) {
+    if ((mantissa & 0x00001000u) != 0) {
         mantissa += 0x00002000u;
-        if ((mantissa & 0x00800000u) == 1) { // 产生了进位，将小数位清空，指数加一
+        if ((mantissa & 0x00800000u) != 0) { // 产生了进位，将小数位清空，指数加一
             mantissa = 0;
             exponent++;
             if (exponent >= 31) {
@@ -124,6 +124,7 @@ std::vector<BlockQ80> QuantizeToQ80(const Tensor& t) {
             }
 
             BlockQ80 block;
+            std::memset(&block, 0, sizeof(block));
             if (max_abs > 0.0f) {
                 float d = max_abs / 127.0f;
                 block.d = FloatToFp16(d);
@@ -202,6 +203,7 @@ std::vector<BlockQ40> QuantizeToQ40(const Tensor& t) {
             }
 
             BlockQ40 block;
+            std::memset(&block, 0, sizeof(block));
             if (max_abs > 0.0f) {
                 float d = max_abs / 7.0f;
                 block.d = FloatToFp16(d);

@@ -19,7 +19,7 @@ Tensor ElementMutmul(const Tensor& a, const Tensor& b) {
         throw std::runtime_error("ElementMutmul: shape is not match");
     }
     Tensor y(a.shape, 0.0f);
-    for (int i = 0; i < a.shape[0]; i++) {
+    for (int i = 0; i < a.Size(); i++) {
         y.data[i] = a.data[i] * b.data[i];
     }
     return y;
@@ -78,7 +78,7 @@ Tensor Softmax(const Tensor& x) {
     }
     int n = x.shape[0];
     float max_num = x.data[0];
-    for (int i = 0; i < n; i++) {
+    for (int i = 1; i < n; i++) {
         if (x.data[i] > max_num) {
             max_num = x.data[i];
         }
@@ -98,7 +98,7 @@ Tensor Softmax(const Tensor& x) {
 // x * sigmoid(x)
 Tensor Silu(const Tensor& x) {
     Tensor y(x.shape, 0.0f);
-    for (int i = 0; i < x.shape[0]; i++) {
+    for (int i = 0; i < x.Size(); i++) {
         float val = x.data[i];
         y.data[i] = val / (1.0f + std::exp(-val));
     }
@@ -111,7 +111,7 @@ Tensor Swiglu(const Tensor& gate, const Tensor& up) {
         throw std::runtime_error("Swiglu: shape is not match");
     }
     Tensor y(gate.shape, 0.0f);
-    for (int i = 0; i < gate.shape[0]; i++) {
+    for (int i = 0; i < gate.Size(); i++) {
         float val = gate.data[i];
         float sigmoid = 1.0f / (1.0f + std::exp(-val));
         y.data[i] = val * sigmoid * up.data[i];

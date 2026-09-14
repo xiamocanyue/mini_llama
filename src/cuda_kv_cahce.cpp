@@ -157,7 +157,7 @@ void CudaKVCache::Write(int layer, int pos, const Tensor& k, const Tensor& v) {
 void CudaKVCache::WriteDevice(int layer, int pos, const CudaTensor& k, const CudaTensor& v) {
 #ifdef MINI_LLAMA_USE_CUDA
 	ValidateIndices(layer, pos);
-	if (keys_.GetDeviceId() != device_id_ || values_.GetDeviceId() != device_id_) {
+	if (k.GetDeviceId() != device_id_ || v.GetDeviceId() != device_id_) {
 		throw std::runtime_error("Cuda kv_cache: tensor is not on same device");
 	}
 	const size_t expected = GetAndCheckMul(static_cast<size_t>(n_kv_heads_), static_cast<size_t>(head_dim_), "n_kv_heads * head_dim");
@@ -177,7 +177,7 @@ void CudaKVCache::WriteDevice(int layer, int pos, const CudaTensor& k, const Cud
 	(void)pos;
 	(void)k;
 	(void)v;
-	throw CudaKvCacheNotBuilt();
+	throw CudaKVCacheNotBuilt();
 #endif
 }
 
