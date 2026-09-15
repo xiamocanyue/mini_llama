@@ -19,7 +19,7 @@ cmake --build build-cpu --parallel
 ctest --test-dir build-cpu --output-on-failure
 ```
 
-运行 tiny 模型：
+运行 tiny 模型： 
 
 ```bash
 ./build-cpu/mini-llama generate \
