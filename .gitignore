@@ -8,5 +8,7 @@ CMakeCache.txt
 CMakeFiles/
 artifacts/
 TEST_REPORT.md
+result/
+Resolve.md
 python/__pycache__/
 models/chat/Qwen*

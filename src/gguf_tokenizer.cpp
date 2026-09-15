@@ -206,10 +206,9 @@ std::vector<int> GgufTokenizer::Encode(const std::string& text) const {
             }
         }
         
-        pos = end;
-
         std::string segment = text.substr(pos, end - pos);
-
+        pos = end;
+   
         std::vector<std::string> words;
         for (unsigned char c : segment) {
             if (c >= byte_to_unicode_.size()) {

@@ -299,8 +299,8 @@ Tensor DequantizeFromQ41(const std::vector<BlockQ41>& blocks, const std::vector<
             float d = Fp16ToFloat(block.d);
             float m = Fp16ToFloat(block.m);
             for (int i = 0; i < kQ40BlockSize / 2; i++) {
-                int q0 = static_cast<int>((block.qs[i] & 0x0fu) - 8);
-                int q1 = static_cast<int>((block.qs[i] >> 4) - 8);
+                int q0 = static_cast<int>((block.qs[i] & 0x0fu));
+                int q1 = static_cast<int>((block.qs[i] >> 4));
 
                 int x0_index = block_begin + i;
                 int x1_index = block_begin + i + kQ41BlockSize / 2;

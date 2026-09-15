@@ -79,7 +79,7 @@ size_t Tensor::GetFlatIndex(const std::vector<int>& index) const {
     size_t stride = 1;
     size_t flat = 0;
     for (int i = static_cast<int>(shape.size() - 1); i >= 0; i--) {
-        flat += static_cast<size_t>(shape[i]) * stride;
+        flat += static_cast<size_t>(index[i]) * stride;
         stride *= static_cast<size_t>(shape[i]);
     }
 

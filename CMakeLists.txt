@@ -28,7 +28,7 @@ set(MINI_LLAMA_CORE_SOURCES
     src/context.cpp
     src/cuda_attention.cpp
     src/cuda_data.cpp
-    src/cuda_kv_cahce.cpp
+    src/cuda_kv_cache.cpp
     src/cuda_matmul.cpp
     src/cuda_ops.cpp
     src/cuda_quant.cpp
@@ -76,6 +76,7 @@ if(MINI_LLAMA_CUDA)
 endif()
 
 add_executable(mini-llama src/main.cpp)
+target_sources(mini-llama PRIVATE src/cli_commands.cpp)
 target_link_libraries(mini-llama PRIVATE mini-llama-core)
 
 if(MINI_LLAMA_BUILD_TESTS)

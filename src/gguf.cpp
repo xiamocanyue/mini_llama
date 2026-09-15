@@ -455,29 +455,29 @@ bool GgufReader::Load(const std::string& path) {
     for (uint64_t i = 0; i < n_tensors; i++) {
         GgufTensorInfo info;
         if (!ReadString(f, info.name)) {
-            
+            return ReturnFailure(load_error, "failed to read tensor name at FlatIndex " + std::to_string(i));
         }
         uint32_t n_dims;
         if (!ReadU32(f, n_dims)) {
-
+            return ReturnFailure(load_error, "failed to read tensor n_dims for: " + info.name);
         }
         if (n_dims == 0 || n_dims > kMaxTensorDims) {
-
+            return ReturnFailure(load_error, "invalid tensor n_dims for: " + info.name);
         }
         info.shape.resize(n_dims);
         for (uint32_t j = 0; j < n_dims; j++) {
             if (!ReadU64(f, info.shape[j])) {
-
+                return ReturnFailure(load_error, "failed to read tensor shape for: " + info.name);
             }
             if (info.shape[j] == 0) {
-
+                return ReturnFailure(load_error, "invalid zero tensor dimension for: " + info.name);
             }
         }
         if (!ReadU32(f, info.quant_type)) {
-
+            return ReturnFailure(load_error, "failed to read tensor type for: " + info.name);
         }
         if (!ReadU64(f, info.offset)) {
-
+            return ReturnFailure(load_error, "failed to read tensor offset for: " + info.name);
         }
         tensor_infos.push_back(std::move(info));
     }
@@ -485,18 +485,18 @@ bool GgufReader::Load(const std::string& path) {
     std::unordered_set<std::string> name_set;
     for (auto& info : tensor_infos) {
         if (!name_set.insert(info.name).second) {
-
+            return ReturnFailure(load_error, "duplicate tensor name: " + tensor.name);
         }
     }
 
     //Padding
     uint64_t alignment = ParseAlignment(metadatas);
     if (alignment == 0) {
-
+        return ReturnFailure(load_error, "duplicate tensor name: " + tensor.name);
     }
     std::streampos current = f.tellg();
     if (current < 0) {
-
+        return ReturnFailure(load_error, "failed to determine GGUF data offset");
     }
     data_offset = current;
     uint64_t padding = (alignment - (current % alignment)) % alignment;
@@ -506,14 +506,14 @@ bool GgufReader::Load(const std::string& path) {
     f.seekg(0, std::ios::end);
     std::streampos end = f.tellg();
     if (end < 0 || static_cast<uint64_t>(end) > data_offset) {
-
+        return ReturnFailure(load_error, "GGUF file ended before tensor data section");
     }
     uint64_t file_size = static_cast<uint64_t>(end);
 
     for (auto& info : tensor_infos) {
         uint64_t tensor_size = 0;
         if (!GetTensorByteSize(info, tensor_size)) {
-
+            return ReturnFailure(load_error, "invalid tensor data size for: " + tensor.name);
         }
         if (tensor_size == 0) {
             continue;
@@ -521,16 +521,16 @@ bool GgufReader::Load(const std::string& path) {
 
         uint64_t tensor_start = 0;
         if (!CheckAndGetAddOut(data_offset, info.offset, tensor_start)) {
-
+            return ReturnFailure(load_error, "tensor offset overflow for: " + tensor.name);
         }
         
         uint64_t tensor_end = 0;
         if (!CheckAndGetAddOut(tensor_start, tensor_size, tensor_end)) {
-
+            return ReturnFailure(load_error, "tensor data range overflow for: " + tensor.name);
         }
 
         if (tensor_end > file_size) {
-
+            return ReturnFailure(load_error, "tensor data outside file bounds: " + tensor.name);
         }
     }
     return true;
