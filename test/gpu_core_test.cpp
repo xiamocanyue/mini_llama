@@ -397,16 +397,14 @@ void TestQuant(int device_id) {
     std::cout << "PASS Q8_0, Q4_0 and Q4_1 linear boundary cases\n";
 }
 
-void TestCacheAndAttention(int device_id) {
+void TestCacheAndAttention(int device_id, int target_pos, int head_dim) {
     Require(CheckCudaKVCacheBuilt(), "CUDA KV cache must be built");
     Require(CheckCudaAttentionBuilt(), "CUDA attention must be built");
     constexpr int layers = 2;
-    constexpr int max_seq_len = 11;
+    const int max_seq_len = target_pos + 7;
     constexpr int n_heads = 4;
     constexpr int n_kv_heads = 2;
-    constexpr int head_dim = 7;
     constexpr int target_layer = 1;
-    constexpr int target_pos = 4;
     KVCache cpu_cache(layers, max_seq_len, n_kv_heads, head_dim);
     CudaKVCache cuda_cache(layers, max_seq_len, n_kv_heads, head_dim, device_id);
     for (int pos = 0; pos <= target_pos; ++pos) {
@@ -436,13 +434,15 @@ void TestCacheAndAttention(int device_id) {
     RequireClose(CudaAttentionDecodeDeviceInputs(
                      q_device, cuda_cache, target_layer, target_pos, max_seq_len,
                      n_heads, n_kv_heads, head_dim, device_id)
-                     .Download(),
+                     .Download().ReshapeAndCheck({n_heads, head_dim},
+                                                "device attention output"),
                  expected, kQuantTolerance, "CUDA device-input GQA attention");
     cuda_cache.Clear();
     RequireClose(cuda_cache.ReadKey(target_layer, target_pos),
                  Tensor({n_kv_heads, head_dim}, 0.0f), 0.0f,
                  "CUDA KV clear");
-    std::cout << "PASS CUDA KV cache and GQA attention\n";
+    std::cout << "PASS CUDA KV cache and GQA attention: pos=" << target_pos
+              << ", head_dim=" << head_dim << "\n";
 }
 
 }  // namespace
@@ -460,7 +460,11 @@ int main(int argc, char** argv) {
         mini_llama::TestMatmulAndOps(device_id);
         mini_llama::TestRope(device_id);
         mini_llama::TestQuant(device_id);
-        mini_llama::TestCacheAndAttention(device_id);
+        for (int head_dim : {7, 128, 129}) {
+            for (int pos : {0, 4, 126, 127, 128, 256}) {
+                mini_llama::TestCacheAndAttention(device_id, pos, head_dim);
+            }
+        }
         std::cout << "PASS gpu-core-test\n";
         return 0;
     } catch (const std::exception& error) {

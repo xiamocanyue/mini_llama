@@ -3,6 +3,7 @@
 
 import argparse
 import datetime
+import hashlib
 import os
 import re
 import shutil
@@ -55,15 +56,17 @@ def normalize_arch(value):
 
 def run_logged(name, command, log_dir, env):
     print(f"[{name}] {' '.join(command)}", flush=True)
-    result = subprocess.run(
-        command, cwd=ROOT, env=env, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    output = result.stdout or ""
-    (log_dir / f"{name}.log").write_text(output, encoding="utf-8")
-    if output:
-        print(output, end="" if output.endswith("\n") else "\n")
-    if result.returncode != 0:
-        raise TestFailure(f"{name} failed with exit code {result.returncode}")
+    with (log_dir / f"{name}.log").open("w", encoding="utf-8") as log:
+        with subprocess.Popen(command, cwd=ROOT, env=env, text=True,
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, bufsize=1) as process:
+            for line in process.stdout:
+                log.write(line)
+                log.flush()
+                print(line, end="", flush=True)
+            returncode = process.wait()
+    if returncode != 0:
+        raise TestFailure(f"{name} failed with exit code {returncode}")
 
 
 def write_report(path, status, details, completed, failure=None):
@@ -78,6 +81,11 @@ def write_report(path, status, details, completed, failure=None):
         f"- CMake CUDA architecture: `{details.get('arch', 'unknown')}`",
         f"- CUDA Toolkit: `{details.get('cuda', 'unknown')}`",
         f"- CUDA visible device: `{details.get('device', 'unknown')}`",
+        f"- Attention source SHA-256: `{details.get('attention_sha256', 'unknown')}`",
+        f"- Real GGUF model: `{details.get('real_model', 'not reached')}`",
+        f"- Real GGUF SHA-256: `{details.get('real_model_sha256', 'not reached')}`",
+        f"- Real tokenizer SHA-256: `{details.get('real_tokenizer_sha256', 'not reached')}`",
+        "- Build policy: clean-first (recompile sources, do not reuse object files)",
         "",
         "## Completed stages",
         "",
@@ -99,7 +107,7 @@ def main():
         description="Build and run all mini-llama GPU tests; failures are never skipped")
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build-gpu")
     parser.add_argument("--report-dir", type=Path,
-                        default=ROOT / "artifacts" / "gpu-test")
+                        default=ROOT / "result")
     parser.add_argument("--arch", default="auto",
                         help="CUDA architecture, e.g. 89 for 4090D or 120 for RTX 5060")
     parser.add_argument("--device", type=int, default=0,
@@ -121,6 +129,12 @@ def main():
             "detect_leaks=0:protect_shadow_gap=0:abort_on_error=1:halt_on_error=1")
 
     try:
+        attention_source = ROOT / "src" / "cuda_attention.cu"
+        details["attention_sha256"] = hashlib.sha256(attention_source.read_bytes()).hexdigest()
+        provenance = (f"Source root: {ROOT}\nAttention source: {attention_source}\n"
+                      f"SHA-256: {details['attention_sha256']}\n")
+        (report_dir / "00-gpu-source.log").write_text(provenance, encoding="utf-8")
+        print(provenance, flush=True)
         nvidia_smi = tool("nvidia-smi")
         nvcc = tool("nvcc")
         cmake = tool("cmake")
@@ -167,12 +181,28 @@ def main():
         run_logged("01-configure", configure, report_dir, env)
         completed.append("CMake CUDA configuration")
         run_logged("02-build", [cmake, "--build", str(args.build_dir.resolve()),
-                                 "--parallel", str(args.jobs)], report_dir, env)
+                                 "--clean-first", "--parallel", str(args.jobs)], report_dir, env)
         completed.append("CUDA compile and link")
         run_logged("03-gpu-ctest", [
             ctest, "--test-dir", str(args.build_dir.resolve()), "-L", "gpu",
             "--output-on-failure", "--timeout", "600"], report_dir, env)
         completed.append("GPU core and model-alignment CTest")
+
+        real_model = ROOT / "models/chat/Qwen2-0.5B-Instruct-Q8_0.gguf"
+        real_tokenizer = ROOT / "models/chat/vocab.json"
+        if not real_model.is_file() or not real_tokenizer.is_file():
+            raise TestFailure("real GGUF chat model or tokenizer is missing: "
+                              f"{real_model}, {real_tokenizer}")
+        details["real_model"] = str(real_model)
+        details["real_model_sha256"] = hashlib.sha256(real_model.read_bytes()).hexdigest()
+        details["real_tokenizer_sha256"] = hashlib.sha256(real_tokenizer.read_bytes()).hexdigest()
+        run_logged("04-real-gguf-generate", [
+            str(args.build_dir.resolve() / "mini-llama"), "generate",
+            "--model", str(real_model), "--tokenizer", str(real_tokenizer),
+            "--backend", "cuda", "--device", "0", "--threads", "1",
+            "--prompt", "你好，请用一句话介绍自己。", "--temperature", "0",
+            "--seed", "1", "--n-predict", "8"], report_dir, env)
+        completed.append("Real Qwen2 GGUF CUDA generation")
 
         if not args.skip_sanitizer:
             sanitizer = shutil.which("compute-sanitizer")
@@ -180,27 +210,31 @@ def main():
                 raise TestFailure(
                     "compute-sanitizer not found; install it or explicitly use "
                     "--skip-sanitizer")
-            run_logged("04-compute-sanitizer-core", [
+            run_logged("05-compute-sanitizer-core", [
                 sanitizer, "--tool", "memcheck", "--error-exitcode", "99",
                 str(args.build_dir.resolve() / "gpu-core-test")], report_dir, env)
             completed.append("compute-sanitizer memcheck on GPU core test")
-            run_logged("05-compute-sanitizer-generate", [
+            run_logged("06-compute-sanitizer-generate", [
                 sanitizer, "--tool", "memcheck", "--error-exitcode", "99",
                 str(args.build_dir.resolve() / "mini-llama"), "generate",
-                "--model", "models/tiny/model.bin", "--config",
-                "models/tiny/model.json", "--tokenizer", "models/tiny/vocab.json",
-                "--backend", "cuda", "--device", "0", "--prompt", "hello",
-                "--temperature", "0", "--n-predict", "2"], report_dir, env)
-            completed.append("compute-sanitizer memcheck on CUDA generation")
+                "--model", str(real_model), "--tokenizer", str(real_tokenizer),
+                "--backend", "cuda", "--device", "0", "--prompt",
+                "你好", "--temperature", "0", "--seed", "1", "--n-predict", "2"], report_dir, env)
+            completed.append("compute-sanitizer memcheck on real GGUF CUDA generation")
+            for number, tool_name in (("07", "racecheck"), ("08", "synccheck")):
+                run_logged(f"{number}-compute-sanitizer-{tool_name}", [
+                    sanitizer, "--tool", tool_name, "--error-exitcode", "99",
+                    str(args.build_dir.resolve() / "gpu-core-test")], report_dir, env)
+                completed.append(f"compute-sanitizer {tool_name} on GPU core test")
 
-        write_report(report_dir / "GPU_TEST_RESULT.md", "PASS", details, completed)
-        print(f"PASS: report written to {report_dir / 'GPU_TEST_RESULT.md'}")
+        write_report(report_dir / "Gpu_result.md", "PASS", details, completed)
+        print(f"PASS: report written to {report_dir / 'Gpu_result.md'}")
         return 0
     except (OSError, subprocess.SubprocessError, TestFailure) as error:
-        write_report(report_dir / "GPU_TEST_RESULT.md", "FAIL", details,
+        write_report(report_dir / "Gpu_result.md", "FAIL", details,
                      completed, error)
         print(f"FAIL: {error}", file=sys.stderr)
-        print(f"report written to {report_dir / 'GPU_TEST_RESULT.md'}",
+        print(f"report written to {report_dir / 'Gpu_result.md'}",
               file=sys.stderr)
         return 1
 

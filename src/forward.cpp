@@ -220,17 +220,14 @@ void ForwardQkvProjectionDevice(const MiniLlamaModel& model, const std::string& 
 							const CudaTensor& h, const LayerWeights& lw, 
 							CudaTensor& q_dev, CudaTensor& k_dev, CudaTensor& v_dev) {
 
-    std::string q_name = layer_prefix + "wq";
-    std::string k_name = layer_prefix + "wk";
-    std::string v_name = layer_prefix + "wv";   
-	q_dev = ForwardLinearDevice(model, q_name, h, lw.wq);
-	q_dev = AddOpentionBiasDevice(model, q_name, std::move(q_dev), lw.bq);
+	q_dev = ForwardLinearDevice(model, layer_prefix + "wq", h, lw.wq);
+	q_dev = AddOpentionBiasDevice(model, layer_prefix + "bq", std::move(q_dev), lw.bq);
 
-	k_dev = ForwardLinearDevice(model, k_name, h, lw.wk);
-	k_dev = AddOpentionBiasDevice(model, k_name, std::move(k_dev), lw.bk);
+	k_dev = ForwardLinearDevice(model, layer_prefix + "wk", h, lw.wk);
+	k_dev = AddOpentionBiasDevice(model, layer_prefix + "bk", std::move(k_dev), lw.bk);
 	
-	v_dev = ForwardLinearDevice(model, v_name, h, lw.wv);
-	v_dev = AddOpentionBiasDevice(model, v_name, std::move(v_dev), lw.bv);
+	v_dev = ForwardLinearDevice(model, layer_prefix + "wv", h, lw.wv);
+	v_dev = AddOpentionBiasDevice(model, layer_prefix + "bv", std::move(v_dev), lw.bv);
 }
 
 CudaTensor ForwardRmsNormDevice(const MiniLlamaModel& model, const std::string& name, 

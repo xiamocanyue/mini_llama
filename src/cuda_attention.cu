@@ -102,23 +102,21 @@ __global__ void AttentionScoresKernel(const float* q, const float* key, float* s
 						* static_cast<size_t>(n_kv_heads) + static_cast<size_t>(kv_head_index))
 						* static_cast<size_t>(head_dim);
 
-    __shared__ float temp[kAttentionBlockSize];
+	__shared__ float partial[kAttentionBlockSize];
 	float sum = 0.0f;
 	for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
 		sum += q[q_offset + i] * key[key_offset + i];
 	}
-	temp[threadIdx.x] = sum;
+	partial[threadIdx.x] = sum;
 	__syncthreads();
-
-	for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
 		if (threadIdx.x < stride) {
-			temp[threadIdx.x] += temp[threadIdx.x + stride];
+			partial[threadIdx.x] += partial[threadIdx.x + stride];
 		}
 		__syncthreads();
 	}
-
 	if (threadIdx.x == 0) {
-		score[static_cast<size_t>(head) * static_cast<size_t>(pos + 1) + static_cast<size_t>(index)] = temp[0] * scale;
+		score[static_cast<size_t>(head) * static_cast<size_t>(pos + 1) + static_cast<size_t>(index)] = partial[0] * scale;
 	}
 }
 
@@ -134,43 +132,37 @@ __global__ void AttentionReduceKernel(const float* score, const float* value, fl
 
 	size_t score_base = static_cast<size_t>(head) * static_cast<size_t>(pos + 1);
 	//softmax e^(x - max) / sum
-	__shared__ float max_arr[kAttentionBlockSize];
-	__shared__ float sum_arr[kAttentionBlockSize];
-	float max_num = -INFINITY;
-	float sum_num = 0.0f;
-
+	// Separate buffers prevent the sum stage from overwriting maxima
+	// while other warps are still reading them.
+	__shared__ float maxima[kAttentionBlockSize];
+	__shared__ float sums[kAttentionBlockSize];
+	float local_max = -INFINITY;
 	for (int i = threadIdx.x; i <= pos; i += blockDim.x) {
-		float val = score[score_base + static_cast<size_t>(i)];
-		if (val > max_num) {
-			sum_num = sum_num * expf(max_num - val) + 1.0f;
-			max_num = val;
-		} else {
-			sum_num += expf(val - max_num);
-		}
+		local_max = fmaxf(local_max, score[score_base + static_cast<size_t>(i)]);
 	}
-
-	max_arr[threadIdx.x] = max_num;
-	sum_arr[threadIdx.x] = sum_num;
+	maxima[threadIdx.x] = local_max;
 	__syncthreads();
-
-	for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
 		if (threadIdx.x < stride) {
-			float m1 = max_arr[threadIdx.x];
-			float m2 = max_arr[threadIdx.x + stride];
-			float s1 = sum_arr[threadIdx.x];
-			float s2 = sum_arr[threadIdx.x + stride];
-
-			float m_new = fmaxf(m1, m2);
-			float s_new = s1 * expf(m1 - m_new) + s2 * expf(m2 - m_new);
-
-			max_arr[threadIdx.x] = m_new;
-			sum_arr[threadIdx.x] = s_new;
+			maxima[threadIdx.x] = fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
 		}
 		__syncthreads();
 	}
-
-	float max_score = max_arr[0];
-	float sum = 1.0f / sum_arr[0];
+	float max_score = maxima[0];
+	float local_sum = 0.0f;
+	// Empty lanes contribute zero, without evaluating -Inf - (-Inf).
+	for (int i = threadIdx.x; i <= pos; i += blockDim.x) {
+		local_sum += expf(score[score_base + static_cast<size_t>(i)] - max_score);
+	}
+	sums[threadIdx.x] = local_sum;
+	__syncthreads();
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+		if (threadIdx.x < stride) {
+			sums[threadIdx.x] += sums[threadIdx.x + stride];
+		}
+		__syncthreads();
+	}
+	float sum = 1.0f / sums[0];
 
 	size_t kv_head_index = head / (n_heads / n_kv_heads);
 

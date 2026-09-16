@@ -1,95 +1,96 @@
 #!/usr/bin/env python3
-"""Build, test, and benchmark the CPU backend, saving a timestamped report."""
+"""Build and run the CPU suite, writing a self-contained Markdown report."""
 
 import argparse
-import datetime as dt
-import platform
+import datetime
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run_stage(name, command, cwd=ROOT):
-    result = subprocess.run(
-        command, cwd=cwd, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT)
-    return {
-        "name": name,
-        "command": " ".join(str(item) for item in command),
-        "returncode": result.returncode,
-        "output": result.stdout or "",
-    }
+def select_build_dir(requested):
+    cache = requested / "CMakeCache.txt"
+    if cache.is_file():
+        entries = dict(line.split("=", 1) for line in
+                       cache.read_text(encoding="utf-8").splitlines()
+                       if "=" in line and not line.startswith(("#", "//")))
+        expected = {"CMAKE_HOME_DIRECTORY:INTERNAL": ROOT,
+                    "CMAKE_CACHEFILE_DIR:INTERNAL": requested}
+        if any(key in entries and Path(entries[key]).resolve() != path.resolve()
+               for key, path in expected.items()):
+            replacement = Path(tempfile.mkdtemp(prefix="build-cpu-relocated-", dir=ROOT))
+            return replacement, f"Relocated CMake cache in {requested}; preserved it and selected {replacement}."
+    return requested, "Using requested build directory."
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run CPU tests and benchmarks and save a Markdown report")
+    parser = argparse.ArgumentParser(description="Run all mini-llama CPU tests")
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build-cpu")
-    parser.add_argument("--result-dir", type=Path, default=ROOT / "result")
-    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--report-dir", type=Path, default=ROOT / "result")
+    parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1))
     args = parser.parse_args()
+    report_dir = args.report_dir.resolve()
+    report_dir.mkdir(parents=True, exist_ok=True)
+    build_dir, build_note = select_build_dir(args.build_dir.resolve())
+    print(build_note, flush=True)
+    steps = []
+    outputs = []
+    failure = None
 
-    build_dir = args.build_dir.resolve()
-    result_dir = args.result_dir.resolve()
-    result_dir.mkdir(parents=True, exist_ok=True)
-    binary = build_dir / "mini-llama"
-    stages = []
-
-    stages.append(run_stage("configure", [
-        "cmake", "-S", str(ROOT), "-B", str(build_dir),
-        "-DMINI_LLAMA_CUDA=OFF", "-DMINI_LLAMA_BUILD_TESTS=ON",
-        "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
-    ]))
-    if stages[-1]["returncode"] == 0:
-        stages.append(run_stage("build", [
-            "cmake", "--build", str(build_dir), "--parallel", str(args.jobs)
-        ]))
-    if binary.is_file():
-        stages.append(run_stage("ctest", [
-            "ctest", "--test-dir", str(build_dir), "--output-on-failure"
-        ]))
-        stages.append(run_stage("python-model-alignment", [
-            sys.executable, str(ROOT / "python" / "test_model_alignment.py"),
-            "--binary", str(binary)
-        ]))
-        for label, extra in (
-                ("benchmark-native", []),
-                ("benchmark-q8_0", ["--quant", "q8_0"]),
-                ("benchmark-q4_0", ["--quant", "q4_0"])):
-            stages.append(run_stage(label, [
-                str(binary), "bench", "models/tiny", "--backend", "cpu",
-                "--threads", "1", "--seed", "1", "--n-predict", "4",
-                *extra
-            ]))
-
-    timestamp = dt.datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    report_path = result_dir / f"cpu_test_{timestamp}.md"
-    passed = bool(stages) and all(stage["returncode"] == 0 for stage in stages)
-    lines = [
-        "# Mini Llama CPU Test Report", "",
-        f"- Status: **{'PASS' if passed else 'FAIL'}**",
-        f"- Time: `{dt.datetime.now().astimezone().isoformat(timespec='seconds')}`",
-        f"- Platform: `{platform.platform()}`",
-        f"- Build directory: `{build_dir}`", "",
-        "## Summary", "",
+    commands = [
+        ("CMake CPU configure", ["cmake", "-S", str(ROOT), "-B", str(build_dir),
+                                 "-DMINI_LLAMA_CUDA=OFF", "-DMINI_LLAMA_BUILD_TESTS=ON",
+                                 "-DCMAKE_BUILD_TYPE=RelWithDebInfo"]),
+        ("CPU compile and link", ["cmake", "--build", str(build_dir), "--parallel",
+                                  str(args.jobs)]),
+        ("CPU CTest", ["ctest", "--test-dir", str(build_dir), "-LE", "gpu",
+                       "--output-on-failure", "--timeout", "600"]),
     ]
-    for stage in stages:
-        status = "PASS" if stage["returncode"] == 0 else "FAIL"
-        lines.append(f"- **{status}** `{stage['name']}` (exit {stage['returncode']})")
-    if not stages:
-        lines.append("- **FAIL** no stages were executed")
-    lines.extend(["", "## Stage Output", ""])
-    for stage in stages:
-        lines.extend([
-            f"### {stage['name']}", "", f"Command: `{stage['command']}`", "",
-            "```text", stage["output"].rstrip(), "```", ""
-        ])
-    report_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"{'PASS' if passed else 'FAIL'}: report written to {report_path}")
-    return 0 if passed else 1
+    for name, command in commands:
+        try:
+            print(f"[{name}] {' '.join(command)}", flush=True)
+            chunks = []
+            with subprocess.Popen(command, cwd=ROOT, text=True,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, bufsize=1) as process:
+                for line in process.stdout:
+                    chunks.append(line)
+                    print(line, end="", flush=True)
+                returncode = process.wait()
+            output = "".join(chunks)
+            outputs.append((name, command, output))
+            if returncode != 0:
+                failure = f"{name} failed with exit code {returncode}"
+                break
+            steps.append(name)
+        except OSError as error:
+            failure = f"{name} could not start: {error}"
+            break
+
+    status = "PASS" if failure is None else "FAIL"
+    lines = [
+        "# CPU test result", "", f"- Status: **{status}**",
+        f"- Time: `{datetime.datetime.now().astimezone().isoformat(timespec='seconds')}`",
+        f"- Build directory: `{build_dir}`", f"- Build selection: {build_note}",
+        "", "## Completed stages", "",
+    ]
+    if steps:
+        lines.extend(f"- {step}" for step in steps)
+    else:
+        lines.append("- None")
+    if failure:
+        lines.extend(["", "## Failure", "", "```text", failure, "```"])
+    lines.extend(["", "## Command output", ""])
+    for name, command, output in outputs:
+        lines.extend([f"### {name}", "", "```text", "$ " + " ".join(command),
+                      output.rstrip(), "```", ""])
+    (report_dir / "Cpu_result.md").write_text("\n".join(lines), encoding="utf-8")
+    print(f"{status}: report written to {report_dir / 'Cpu_result.md'}")
+    return 0 if failure is None else 1
 
 
 if __name__ == "__main__":

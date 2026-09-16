@@ -59,7 +59,7 @@ def main():
     overall_rel = 0.0
     total_steps = 0
     for prompt, n_predict in cases:
-        steps, max_abs, max_rel, tokens = run_case(binary, prompt, n_predict)
+        steps, max_abs, max_rel, tokens, _ = run_case(binary, prompt, n_predict)
         total_steps += steps
         overall_abs = max(overall_abs, max_abs)
         overall_rel = max(overall_rel, max_rel)
