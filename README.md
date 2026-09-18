@@ -135,7 +135,7 @@ GPU 脚本强制重新编译，实时显示输出并记录 attention 源码 SHA-
 | 指标 | CPU（14 threads，本地） | GPU（RTX 4090 D，云端） | GPU/CPU |
 | --- | ---: | ---: | ---: |
 | Prefill | 24886.374 ms / **0.2815 tokens/s** | 875.680 ms / **7.99 tokens/s** | **28.38x** |
-| Decode | 14086.460 ms / **0.4969 tokens/s** | 128.014 ms / **54.68 tokens/s** | **9.01x** |
+| Decode | 14086.460 ms / **0.4969 tokens/s** | 128.014 ms / **54.68 tokens/s** | **110.04x** |
 
 这是一组单次冷运行的方向性结果：CPU 与 GPU 的硬件环境不同，线程配置也不同，尚未经过 5 次预热、30 次重复、p95、CPU RSS 和 GPU 峰值显存测量。因此这些数字适合说明测试方法和量级，不应视为稳定性能承诺；正式性能应使用 `python/benchmark_backends.py` 生成 raw timings 后再更新。
 
