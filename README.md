@@ -39,7 +39,6 @@ ctest --test-dir build-cpu --output-on-failure < /dev/null
 python3 python/run_cpu_tests.py
 ```
 
-每次运行写入 `result/Cpu_result.md`，保留命令、输出和通过/失败状态。当前脚本不自动运行性能 benchmark。异地 CMake 缓存会被保留，脚本另建目录完成构建。`result/` 已被 Git 忽略；报告会覆盖，应按需归档，且不要同时启动多份测试。
 
 ## 目录结构
 
@@ -102,7 +101,7 @@ GPU 脚本强制重新编译，实时显示输出并记录 attention 源码 SHA-
 
 本节同时包含 tiny kernel 回归和真实 Qwen2 GGUF 结果。tiny 主要验证 CUDA kernel 与数值对齐；Qwen2 结果用于展示真实模型的加载、生成和 CPU/GPU 方向性差异。
 
-仙宫云 NVIDIA GeForce RTX 4090 D，显存约 23.54 GiB，计算能力 8.9，CUDA Toolkit 12.6；报告完成时间为北京时间 20:54:36（UTC 12:54:36）。执行完整默认命令，CPU/GPU 退出码均为 0，总结果 PASS。
+仙宫云 NVIDIA GeForce RTX 4090 D，显存约 23.54 GiB，计算能力 8.9，CUDA Toolkit 12.6；执行完整默认命令，CPU/GPU 退出码均为 0，总结果 PASS。
 
 | 验证项目 | 本次结果 |
 | --- | --- |
@@ -118,7 +117,6 @@ GPU 脚本强制重新编译，实时显示输出并记录 attention 源码 SHA-
 | 真实 Qwen2 GPU decode | 128.014 ms / 7 steps = **54.68 tokens/s** |
 | 真实 Qwen2 GPU 内存埋点 | 1401.48 MB；不等同于设备峰值显存 |
 
-已核对 attention 源码 SHA-256 为 `d7855b2fcf207cc41b0b5db0ed5bee8eed2428ae9cd4efb425c568399b27f057`，对应恢复并行点积与两阶段并行 softmax 的版本。上述数据来自本次云端报告，详见 `TEST_REPORT.md` 第 20 节。
 
 #### 同一真实模型的 CPU/GPU 方向性对比
 
