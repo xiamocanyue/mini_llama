@@ -7,7 +7,7 @@
 - CPU 后端：已实现，并由 CTest 覆盖。
 - 数值正确性：使用独立 Python 参考实现对比 C++ logits 和生成 token。
 - 量化：已包含 F32/模型原生权重、Q8_0、Q4_0 和 Q4_1 路径；GPU 测试覆盖三种量化 linear，以及 Q8_0/Q4_0 的 CPU/CUDA 模型对齐。
-- CUDA 后端：通过 `MINI_LLAMA_CUDA=ON` 启用；已取得 RTX 4090 D、CUDA 12.6 下的核心测试、tiny 模型数值对齐及 memcheck 通过结果，详见下方实测记录。
+- CUDA 后端：通过 `MINI_LLAMA_CUDA=ON` 启用；完成 RTX 4090 D、CUDA 12.6 下的核心测试、tiny 模型数值对齐及 memcheck 通过。
 
 ## 编译与运行
 
@@ -83,14 +83,6 @@ sequenceDiagram
   C-->>U: 输出生成文本
 ```
 
-## 技术取舍与 CPU 实测
-
-以下 CPU 性能数字为历史记录，不是本次 4090D 测试的新测量结果，当前一键脚本也不会重新生成这些 benchmark 数字。
-
-- **可读参考路径与最大吞吐**：显式保留张量形状和参数校验，便于验证 CPU/CUDA 对齐；代价是部分路径会增加检查和拷贝。
-- **量化与数值精度**：tiny 模型的单线程 `RelWithDebInfo` 结果为：原生权重 `146.31` tokens/s、`0.13 MB`；Q8_0 为 `204.75` tokens/s、权重压缩 `2.74x`、最大 logits 误差 `7.412e-4`；Q4_0 为 `282.06` tokens/s、压缩 `3.94x`、最大误差 `1.308e-2`。低精度减少了内存占用，并提高了该样本的速度，但增大了数值误差。
-- **独立 Python 参考实现与测试复杂度**：对齐测试逐步比较 logits 和生成 token。当前 CPU 测试覆盖 2 个 prompt、20 个推理步骤，C++ 与 Python 路径的最大绝对误差为 `4.47e-8`。
-
 ## CUDA 验证
 
 在具备受支持 NVIDIA GPU、CUDA Toolkit 和 compute-sanitizer 的设备上执行：
@@ -106,7 +98,7 @@ GPU 脚本强制重新编译，实时显示输出并记录 attention 源码 SHA-
 
 结果保存在 `result/Final_result.md`、`Cpu_result.md`、`Gpu_result.md`，阶段日志包括真实 GGUF 生成、memcheck、racecheck 和 synccheck（`04-real-gguf-generate.log` 至 `08-compute-sanitizer-synccheck.log`），总运行输出为 `Cpu_runner.log` 和 `Gpu_runner.log`。某阶段失败会阻断后续 GPU 阶段。
 
-### 4090D 实测结果（2026-09-16）
+### 4090D 实测结果
 
 本节同时包含 tiny kernel 回归和真实 Qwen2 GGUF 结果。tiny 主要验证 CUDA kernel 与数值对齐；Qwen2 结果用于展示真实模型的加载、生成和 CPU/GPU 方向性差异。
 
@@ -145,12 +137,3 @@ CTest 默认不打印成功用例的详细误差，因此本批日志未保留�
 python3 python/test_gpu_alignment.py --binary build-gpu/mini-llama --keep-output result/logits
 ```
 
-### 后续建议测试（尚未完成）
-
-- 增加真实 GGUF 模型端到端 CPU/GPU 对齐、Q4_1 模型生成，以及长上下文和多轮聊天；当前真实模型已完成 GPU smoke test，但还没有完整 CPU/GPU logits 对齐。
-- 单独进行无 sanitizer 的预热、多轮性能测量，记录 prefill/decode 吞吐、峰值显存及持续运行的显存变化；本次 sanitizer 耗时不作为性能指标。
-- 条件允许时增加多 GPU 设备错误路径与其他显卡/工具链验证。当前实机结论限定于 4090D + CUDA 12.6。
-
-## 已知限制
-
-tiny 模型只是正确性测试样本，不代表真实模型的生成质量或性能。性能数据会受编译器、CPU、线程数、模型和构建类型影响；GPU 数据必须与显卡型号和 CUDA 版本一起报告。
