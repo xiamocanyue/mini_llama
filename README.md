@@ -127,9 +127,6 @@ GPU 脚本强制重新编译，实时显示输出并记录 attention 源码 SHA-
 | Prefill | 24886.374 ms / **0.2815 tokens/s** | 875.680 ms / **7.99 tokens/s** | **28.38x** |
 | Decode | 14086.460 ms / **0.4969 tokens/s** | 128.014 ms / **54.68 tokens/s** | **110.04x** |
 
-这是一组单次冷运行的方向性结果：CPU 与 GPU 的硬件环境不同，线程配置也不同，尚未经过 5 次预热、30 次重复、p95、CPU RSS 和 GPU 峰值显存测量。因此这些数字适合说明测试方法和量级，不应视为稳定性能承诺；正式性能应使用 `python/benchmark_backends.py` 生成 raw timings 后再更新。
-
-CTest 默认不打印成功用例的详细误差，因此本批日志未保留模型对齐的实测最大误差；不可将测试容差作为实测误差。需要留存逐步 logits 时，可另行执行：
 
 ```bash
 python3 python/test_gpu_alignment.py --binary build-gpu/mini-llama --keep-output result/logits
