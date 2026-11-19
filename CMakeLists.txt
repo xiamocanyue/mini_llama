@@ -109,6 +109,19 @@ if(MINI_LLAMA_BUILD_TESTS)
         set_tests_properties(python-model-alignment-test PROPERTIES
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         )
+
+        if(NOT MINI_LLAMA_CUDA)
+            set(benchmark_test_options --check-no-cuda)
+        endif()
+        add_test(
+            NAME python-benchmark-test
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/python/test_benchmark.py
+                    --binary $<TARGET_FILE:mini-llama> ${benchmark_test_options}
+        )
+        set_tests_properties(python-benchmark-test PROPERTIES
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        )
     endif()
 
     if(MINI_LLAMA_CUDA)

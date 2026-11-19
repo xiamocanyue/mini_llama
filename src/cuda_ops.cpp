@@ -133,6 +133,17 @@ CudaTensor CudaEmbedding(const void* embedding_data, const std::vector<int>& emb
     throw CudaNotBuiltOps();
 }
 
+void CudaRopeDeviceBatch(CudaTensor&, CudaTensor&, int, int, int, int, float, RopeType, int) {
+    throw CudaNotBuiltOps();
+}
+
+CudaTensor CudaEmbeddingBatch(const void*, const std::vector<int>&, const int*, int, int) {
+    throw CudaNotBuiltOps();
+}
+
+int CudaArgMax(const CudaTensor&, CudaDeviceBuffer&) {
+    throw CudaNotBuiltOps();
+}
 
 #endif
 

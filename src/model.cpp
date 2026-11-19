@@ -336,6 +336,24 @@ size_t ModelCudaMemoryBytes(const MiniLlamaModel& model) {
     return model.cuda_weights->uploaded_bytes;
 }
 
+CudaModelOpStats CudaModelOpStats::Since(const CudaModelOpStats& start) const {
+    return {linear_calls - start.linear_calls, activation_calls - start.activation_calls,
+            attention_calls - start.attention_calls,
+            attention_cpu_fallbacks - start.attention_cpu_fallbacks,
+            kv_cache_read_bytes - start.kv_cache_read_bytes,
+            kv_cache_write_bytes - start.kv_cache_write_bytes};
+}
+
+CudaModelOpStats GetCudaModelOpStats(const MiniLlamaModel& model) {
+    if (!model.cuda_weights) {
+        return {};
+    }
+    const auto& weights = *model.cuda_weights;
+    return {weights.linear_calls, weights.activation_calls, weights.attention_calls,
+            weights.attention_cpu_fallbacks, weights.kv_cache_read_bytes,
+            weights.kv_cache_write_bytes};
+}
+
 void ResetModelCudaRuntimeStats(MiniLlamaModel& model) {
     if (!model.cuda_weights) {
         return;

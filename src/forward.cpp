@@ -1,6 +1,8 @@
 #include "include/forward.h"
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "include/ops.h"
 #include "include/kv_cache.h"
@@ -91,7 +93,7 @@ void RecordCudaKvCacheWrite(const MiniLlamaModel& model, size_t bytes) {
 	model.cuda_weights->kv_cache_write_bytes += bytes;
 }
 
-void ValidateForwardInputs(const MiniLlamaContext& ctx, const MiniLlamaModel& model, int token_id) {
+void ValidateForwardInputs(const MiniLlamaModel& model, int token_id, int pos) {
 	const ModelConfig& c = model.config;
 	if (!model.is_loaded) {
 		throw std::runtime_error("ForwardToken called with an unloaded model");
@@ -99,7 +101,7 @@ void ValidateForwardInputs(const MiniLlamaContext& ctx, const MiniLlamaModel& mo
 	if (token_id < 0 || token_id >= c.vocab_size) {
 		throw std::out_of_range("ForwardToken token id out of range");
 	}
-	if (ctx.pos < 0 || ctx.pos >= c.max_seq_len) {
+	if (pos < 0 || pos >= c.max_seq_len) {
 		throw std::out_of_range("ForwardToken position out of range");
 	}
 	if (model.layers.size() != static_cast<size_t>(c.n_layers)) {
@@ -107,7 +109,7 @@ void ValidateForwardInputs(const MiniLlamaContext& ctx, const MiniLlamaModel& mo
 			"ForwardToken layer count does not match model config");
 	}
 	if (model.token_embedding.data.size() <
-		static_cast<size_t>(c.vocab_size * c.dim)) {
+		static_cast<size_t>(c.vocab_size) * c.dim) {
 		throw std::runtime_error(
 			"ForwardToken token embedding tensor is smaller than config");
 	}
@@ -290,13 +292,16 @@ CudaTensor ForwardFFNDevice(const MiniLlamaModel& model, const CudaTensor& h, co
 }
 
 CudaTensor ForwardLayerDevice(MiniLlamaContext& ctx, const MiniLlamaModel& model, 
-					const CudaTensor& x_dev, int layer, const LayerWeights& lw, const ModelConfig& config) {
+					const CudaTensor& x_dev, int layer, const LayerWeights& lw, const ModelConfig& config,
+                    int pos) {
 	int dim = config.dim;
 	int n_heads = config.n_heads;
 	int n_kv_heads = config.n_kv_heads;
 	int head_dim = config.head_dim;
-	int pos = ctx.pos;
 	int max_seq_len = config.max_seq_len;
+    const bool batched = x_dev.GetDimNum() == 2;
+    const int rows = batched ? x_dev.Shape()[0] : 1;
+    const size_t layer_size = static_cast<size_t>(rows) * dim;
 	const std::string layer_prefix = "layers." + std::to_string(layer) + ".";
 
 	CudaTensor h = ForwardRmsNormDevice(model, layer_prefix + "attention_norm", x_dev, 
@@ -306,11 +311,25 @@ CudaTensor ForwardLayerDevice(MiniLlamaContext& ctx, const MiniLlamaModel& model
 	CudaTensor k_dev;
 	CudaTensor v_dev;
 	ForwardQkvProjectionDevice(model, layer_prefix, h, lw, q_dev, k_dev, v_dev);
-	ForwardRopeDevice(model, q_dev, k_dev, n_heads, n_kv_heads, head_dim, pos, config.rope_theta, config.rope_type);
-	CudaTensor attn_result = ForwardAttentionDevice(model, q_dev, k_dev, v_dev, pos, layer, 
-							ctx.cuda_kv_cache_, max_seq_len, n_heads, head_dim, n_kv_heads);
+    CudaTensor attn_result;
+    if (batched) {
+        CudaRopeDeviceBatch(q_dev, k_dev, n_heads, n_kv_heads, head_dim, pos,
+                            config.rope_theta, config.rope_type, GetCudaDeviceId(model));
+        RecordCudaActivationCall(model);
+        ctx.cuda_kv_cache_.WriteDeviceBatch(layer, pos, k_dev, v_dev);
+        RecordCudaKvCacheWrite(model, k_dev.GetBytes() + v_dev.GetBytes());
+        attn_result = CudaAttentionPrefill(q_dev, ctx.cuda_kv_cache_, layer, pos, n_heads);
+        const size_t visible_positions = static_cast<size_t>(rows) * (pos + 1) +
+                                         static_cast<size_t>(rows) * (rows - 1) / 2;
+        RecordCudaKvCacheRead(model, visible_positions * n_kv_heads * head_dim * sizeof(float) * 2);
+    } else {
+        ForwardRopeDevice(model, q_dev, k_dev, n_heads, n_kv_heads, head_dim, pos,
+                          config.rope_theta, config.rope_type);
+        attn_result = ForwardAttentionDevice(model, q_dev, k_dev, v_dev, pos, layer,
+                                           ctx.cuda_kv_cache_, max_seq_len, n_heads, head_dim, n_kv_heads);
+    }
 	CudaTensor attn_proj = ForwardLinearDevice(model, layer_prefix + "wo", attn_result, lw.wo);
-	if (attn_proj.GetSize() != static_cast<size_t>(dim)) {
+	if (attn_proj.GetSize() != layer_size) {
 		throw std::runtime_error("forward_layer_device: attention projection shape mismatch");
 	}
 	CudaTensor x_attn = ForwardAddDevice(model, attn_proj, x_dev);
@@ -318,18 +337,155 @@ CudaTensor ForwardLayerDevice(MiniLlamaContext& ctx, const MiniLlamaModel& model
 	//FFN
 	CudaTensor h2 = ForwardRmsNormDevice(model, layer_prefix + "ffn_norm", x_attn, lw.ffn_norm, config.rms_norm_eps);
 	CudaTensor ff = ForwardFFNDevice(model, h2, layer_prefix, lw);
-	if (ff.GetSize() != static_cast<size_t>(dim)) {
+	if (ff.GetSize() != layer_size) {
 		throw std::runtime_error("forward_layer_device: FFN output shape mismatch");
 	}
 	CudaTensor layer_result = ForwardAddDevice(model, ff, x_attn);
 	return layer_result;
 }
 
-Tensor ComputeLogitsDevice(const CudaTensor& x, const MiniLlamaModel& model, const ModelConfig& config) {
-	CudaTensor norm_x = ForwardRmsNormDevice(model, "final_norm", x, model.final_norm, config.rms_norm_eps);
-	CudaTensor logits_dev = ForwardLinearDevice(model, "lm_head", norm_x, model.lm_head);
-	Tensor logits = DownloadCudaTensor(model, logits_dev);
-	return logits.ReshapeAndCheck({config.vocab_size}, "compute_logits_device");
+CudaTensor ComputeLogitsDevice(const CudaTensor& x, const MiniLlamaModel& model) {
+    CudaTensor norm = ForwardRmsNormDevice(model, "final_norm", x, model.final_norm, model.config.rms_norm_eps);
+    CudaTensor logits = ForwardLinearDevice(model, "lm_head", norm, model.lm_head);
+    if (logits.Shape() != std::vector<int>{model.config.vocab_size}) {
+        throw std::runtime_error("ComputeLogitsDevice: unexpected logits shape");
+    }
+    return logits;
+}
+
+void EnsureCudaKvCache(MiniLlamaContext& ctx, const MiniLlamaModel& model) {
+    if (ctx.cuda_kv_cache_.Empty()) {
+        const auto& config = model.config;
+        ctx.cuda_valid_prefix = 0;
+        ctx.cuda_kv_cache_.Reset(config.n_layers, config.max_seq_len, config.n_kv_heads,
+                                 config.head_dim, GetCudaDeviceId(model));
+    }
+}
+
+CudaTensor ForwardTokenDevice(MiniLlamaContext& ctx, const MiniLlamaModel& model, int token) {
+    ValidateForwardInputs(model, token, ctx.pos);
+    EnsureCudaKvCache(ctx, model);
+    const auto& config = model.config;
+    CudaTensor hidden = EmbedTokenDevice(model, token);
+    for (int layer = 0; layer < config.n_layers; ++layer) {
+        hidden = ForwardLayerDevice(ctx, model, hidden, layer, model.layers[layer], config, ctx.pos);
+    }
+    CudaTensor logits = ComputeLogitsDevice(hidden, model);
+    if (ctx.pos <= ctx.cuda_valid_prefix) {
+        ctx.cuda_valid_prefix = ctx.pos + 1;
+    }
+    return logits;
+}
+
+bool CanUseCudaPrefill(const MiniLlamaContext& ctx, const MiniLlamaModel& model,
+                       const MiniBatch& batch) {
+    const auto& config = model.config;
+    const int count = batch.GetTokensNum();
+    const int start = batch.positions.front();
+    if (!model.cuda_weights->batch_prefill_enabled || count < 2 || start < 0 ||
+        !CudaPrefillAttentionSupports(config.n_heads, config.n_kv_heads, config.head_dim) ||
+        static_cast<size_t>(start) != ctx.token_history.size() ||
+        (start > 0 && (ctx.cuda_kv_cache_.Empty() || start > ctx.cuda_valid_prefix ||
+                       ctx.pos != start - 1))) {
+        return false;
+    }
+    for (int i = 1; i < count; ++i) {
+        if (batch.positions[i] < 0 ||
+            static_cast<size_t>(batch.positions[i]) != static_cast<size_t>(start) + i) {
+            return false;
+        }
+    }
+    return true;
+}
+
+CudaTensor ForwardCudaPrefill(MiniLlamaContext& ctx, const MiniLlamaModel& model,
+                              const MiniBatch& batch) {
+    constexpr int kChunkRows = 128;
+    const auto& config = model.config;
+    const int device = GetCudaDeviceId(model);
+    const int start = batch.positions.front();
+    const int count = batch.GetTokensNum();
+    for (int i = 0; i < count; ++i) {
+        ValidateForwardInputs(model, batch.tokens[i], batch.positions[i]);
+    }
+    const auto* embedding = GetCudaWeight(model, "token_embedding", QuantType::kF32);
+    if (!embedding || embedding->shape != model.token_embedding.shape) {
+        throw std::runtime_error("ForwardCudaPrefill: invalid device embedding");
+    }
+    ctx.token_history.reserve(ctx.token_history.size() + batch.tokens.size());
+    try {
+        EnsureCudaKvCache(ctx, model);
+        if (ctx.cuda_kv_cache_.GetDeviceId() != device ||
+            ctx.cuda_kv_cache_.GetNLayers() != config.n_layers ||
+            ctx.cuda_kv_cache_.GetMaxSeqLen() != config.max_seq_len ||
+            ctx.cuda_kv_cache_.GetNKVHeads() != config.n_kv_heads ||
+            ctx.cuda_kv_cache_.GetHeadDim() != config.head_dim) {
+            throw std::runtime_error("ForwardCudaPrefill: cache does not match the model or device");
+        }
+
+        CudaTensor logits;
+        for (int offset = 0; offset < count;) {
+            const int rows = std::min(kChunkRows, count - offset);
+            CudaTensor hidden = CudaEmbeddingBatch(embedding->buffer.GetData(), embedding->shape,
+                                                   batch.tokens.data() + offset, rows, device);
+            RecordCudaHostToDeviceCopy(model, static_cast<size_t>(rows) * sizeof(int));
+            for (int layer = 0; layer < config.n_layers; ++layer) {
+                hidden = ForwardLayerDevice(ctx, model, hidden, layer, model.layers[layer],
+                                            config, start + offset);
+            }
+            offset += rows;
+            if (offset == count) {
+                CudaTensor last_row({config.dim}, device);
+                const auto* source = static_cast<const float*>(hidden.GetData()) +
+                                     static_cast<size_t>(rows - 1) * config.dim;
+                CudaMemcpyBytes(last_row.GetData(), source, last_row.GetBytes(), MemcpyKind::kDeviceToDevice);
+                logits = ComputeLogitsDevice(last_row, model);
+            }
+        }
+        CudaSynchronizeDevice(device);
+        ctx.token_history.insert(ctx.token_history.end(), batch.tokens.begin(), batch.tokens.end());
+        ctx.pos = batch.positions.back();
+        ctx.cuda_valid_prefix = ctx.pos + 1;
+        ctx.last_batch_used_cuda_prefill = true;
+        return logits;
+    } catch (...) {
+        ctx.cuda_kv_cache_ = CudaKVCache{};
+        ctx.cuda_valid_prefix = 0;
+        ctx.token_history.clear();
+        ctx.pos = 0;
+        throw;
+    }
+}
+
+void ValidateBatch(const MiniBatch& batch) {
+    if (batch.tokens.empty()) {
+        throw std::runtime_error("ForwardBatch:batch is empty");
+    }
+    if (batch.tokens.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::length_error("ForwardBatch: too many tokens");
+    }
+    if (batch.tokens.size() != batch.positions.size()) {
+        throw std::runtime_error("ForwardBatch: batch.token size is not match position size");
+    }
+}
+
+CudaTensor ForwardCudaBatch(MiniLlamaContext& ctx, const MiniLlamaModel& model,
+                            const MiniBatch& batch) {
+    ValidateBatch(batch);
+    ctx.last_batch_used_cuda_prefill = false;
+    if (CanUseCudaPrefill(ctx, model, batch)) {
+        return ForwardCudaPrefill(ctx, model, batch);
+    }
+    const int last = batch.GetTokensNum() - 1;
+    for (int i = 0; i < last; ++i) {
+        ctx.pos = batch.positions[i];
+        ForwardToken(ctx, model, batch.tokens[i]);
+        ctx.token_history.push_back(batch.tokens[i]);
+    }
+    ctx.pos = batch.positions[last];
+    CudaTensor logits = ForwardTokenDevice(ctx, model, batch.tokens[last]);
+    ctx.token_history.push_back(batch.tokens[last]);
+    return logits;
 }
 
 
@@ -640,22 +796,13 @@ Tensor ForwardLayer(MiniLlamaContext& ctx, const MiniLlamaModel& model,
 
 
 Tensor ForwardToken(MiniLlamaContext& ctx, const MiniLlamaModel& model, int token_id) {
-	ValidateForwardInputs(ctx, model, token_id);
+    if (model.cuda_weights) {
+        return DownloadCudaTensor(model, ForwardTokenDevice(ctx, model, token_id));
+    }
+    ValidateForwardInputs(model, token_id, ctx.pos);
 
     const ModelConfig& config = model.config;
     int n_layers = config.n_layers;
-	if (model.cuda_weights && ctx.cuda_kv_cache_.Empty()) {
-		ctx.cuda_kv_cache_.Reset(config.n_layers, config.max_seq_len, config.n_kv_heads, 
-							config.head_dim, GetCudaDeviceId(model));
-	}
-
-	if (model.cuda_weights) {
-		CudaTensor x_dev = EmbedTokenDevice(model, token_id);
-		for (int layer = 0; layer < config.n_layers; layer++) {
-			x_dev = ForwardLayerDevice(ctx, model, x_dev, layer, model.layers[layer], config);
-		}
-		return ComputeLogitsDevice(x_dev, model, config);
-	}
 
     Tensor x = EmbedToken(model, token_id);
     for (int layer = 0; layer < n_layers; layer++) {
@@ -667,11 +814,10 @@ Tensor ForwardToken(MiniLlamaContext& ctx, const MiniLlamaModel& model, int toke
 
 //处理一组token，逐个把token记录在上下文中，但只用返回最后一个token的logits，用来预测下一个token
 Tensor ForwardBatch(MiniLlamaContext& ctx, const MiniLlamaModel& model, const MiniBatch& batch) {
-    if (batch.GetTokensNum() == 0) {
-        throw std::runtime_error("ForwardBatch:batch is empty");
-    }
-    if (batch.tokens.size() != batch.positions.size()) {
-        throw std::runtime_error("ForwardBatch: batch.token size is not match position size");
+    ValidateBatch(batch);
+    ctx.last_batch_used_cuda_prefill = false;
+    if (model.cuda_weights && CanUseCudaPrefill(ctx, model, batch)) {
+        return DownloadCudaTensor(model, ForwardCudaPrefill(ctx, model, batch));
     }
 
     Tensor logits;
@@ -681,6 +827,28 @@ Tensor ForwardBatch(MiniLlamaContext& ctx, const MiniLlamaModel& model, const Mi
         ctx.token_history.push_back(batch.tokens[i]);
     }
     return logits;
+}
+
+SamplingLogits ForwardBatchForSampling(MiniLlamaContext& ctx, const MiniLlamaModel& model,
+                                       const MiniBatch& batch, const SamplerParams& params,
+                                       bool require_host_logits) {
+    if (model.cuda_weights && model.cuda_weights->device_greedy_enabled &&
+        !require_host_logits && UseGreedySampling(params)) {
+        return {Tensor{}, ForwardCudaBatch(ctx, model, batch)};
+    }
+    return {ForwardBatch(ctx, model, batch), CudaTensor{}};
+}
+
+int SampleNextToken(MiniLlamaContext& ctx, const SamplingLogits& logits,
+                    MiniSampler& sampler, const SamplerParams& params) {
+    if (logits.device.Empty()) {
+        return sampler.Sample(logits.host, params);
+    }
+    const int token = CudaArgMax(logits.device, ctx.cuda_argmax_workspace);
+    if (ctx.model) {
+        RecordCudaDeviceToHostCopy(*ctx.model, sizeof(token));
+    }
+    return token;
 }
 
 }

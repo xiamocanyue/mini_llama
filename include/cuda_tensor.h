@@ -52,7 +52,7 @@ public:
 
 private:
     std::vector<int> shape_;
-    size_t element_num_;
+    size_t element_num_ = 0;
     CudaDeviceBuffer buffer_;
     int device_id_ = 0;
 };

@@ -1,6 +1,8 @@
 #include "include/cuda_data.h"
 
 
+#include <algorithm>
+#include <atomic>
 #include <stdexcept>
 #include <sstream>
 // #include <cuda_runtime_api.h>
@@ -39,6 +41,23 @@ cudaMemcpyKind ToCudaMemcpyKind(MemcpyKind kind) {
 
 } //namespace
 
+thread_local CudaBufferTracker* CudaBufferTracker::active_ = nullptr;
+
+CudaBufferTracker::CudaBufferTracker(bool enabled) {
+    if (enabled) {
+        static std::atomic<std::uint64_t> next_id{1};
+        id_ = next_id.fetch_add(1, std::memory_order_relaxed);
+        previous_ = active_;
+        active_ = this;
+    }
+}
+
+CudaBufferTracker::~CudaBufferTracker() {
+    if (id_ != 0) {
+        active_ = previous_;
+    }
+}
+
 bool CheckCudaRuntimeBuilt() {
 #ifdef MINI_LLAMA_USE_CUDA
     return true;
@@ -62,6 +81,16 @@ void CudaSetDevice(int device_id) {
 #ifdef MINI_LLAMA_USE_CUDA
     CheckCuda(cudaSetDevice(device_id), "cudaSetDevice");
 #else 
+    (void)device_id;
+    throw CudaNotBuiltError();
+#endif
+}
+
+void CudaSynchronizeDevice(int device_id) {
+#ifdef MINI_LLAMA_USE_CUDA
+    CudaSetDevice(device_id);
+    CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+#else
     (void)device_id;
     throw CudaNotBuiltError();
 #endif
@@ -140,6 +169,15 @@ void CudaMemcpyBytes(void* dst, const void* src, size_t bytes, MemcpyKind kind) 
         throw std::runtime_error("cuda memcpy dst or src is nullptr");
     }
     CheckCuda(cudaMemcpy(dst, src, bytes, ToCudaMemcpyKind(kind)), "cudaMemcpy");
+    if (auto* tracker = CudaBufferTracker::active_) {
+        if (kind == MemcpyKind::kHostToDevice) {
+            ++tracker->stats_.h2d_copies;
+            tracker->stats_.h2d_bytes += bytes;
+        } else if (kind == MemcpyKind::kDeviceToHost) {
+            ++tracker->stats_.d2h_copies;
+            tracker->stats_.d2h_bytes += bytes;
+        }
+    }
 
 #else 
     (void)dst;
@@ -160,10 +198,12 @@ CudaDeviceBuffer::~CudaDeviceBuffer() {
 }
 
 CudaDeviceBuffer::CudaDeviceBuffer(CudaDeviceBuffer&& other) noexcept 
-    : data_(other.data_), bytes_(other.bytes_), device_id_(other.device_id_)  {
+    : data_(other.data_), bytes_(other.bytes_), device_id_(other.device_id_),
+      tracking_id_(other.tracking_id_) {
     other.data_ = nullptr;
     other.bytes_ = 0;
     other.device_id_ = 0;
+    other.tracking_id_ = 0;
 }
 
 CudaDeviceBuffer& CudaDeviceBuffer::operator=(CudaDeviceBuffer&& other) noexcept {
@@ -175,9 +215,11 @@ CudaDeviceBuffer& CudaDeviceBuffer::operator=(CudaDeviceBuffer&& other) noexcept
     data_ = other.data_;
     bytes_ = other.bytes_;
     device_id_ = other.device_id_;
+    tracking_id_ = other.tracking_id_;
     other.data_ = nullptr;
     other.bytes_ = 0;
     other.device_id_ = 0;
+    other.tracking_id_ = 0;
     return *this;
 }
 
@@ -187,9 +229,14 @@ void CudaDeviceBuffer::Reset() {
     }
     CudaSetDevice(device_id_);
     CudaFreeBytes(data_);
+    auto* tracker = CudaBufferTracker::active_;
+    if (tracker && tracker->id_ == tracking_id_) {
+        tracker->stats_.live_bytes -= bytes_;
+    }
     data_ = nullptr;
     bytes_ = 0;
     device_id_ = 0;
+    tracking_id_ = 0;
 }
 
 void CudaDeviceBuffer::Reset(size_t bytes, int device_id) {
@@ -204,6 +251,13 @@ void CudaDeviceBuffer::Reset(size_t bytes, int device_id) {
     data_ = CudaMallocBytes(bytes);
     device_id_ = device_id;
     bytes_ = bytes;
+    if (auto* tracker = CudaBufferTracker::active_) {
+        tracking_id_ = tracker->id_;
+        auto& stats = tracker->stats_;
+        ++stats.allocations;
+        stats.live_bytes += bytes;
+        stats.peak_bytes = std::max(stats.peak_bytes, stats.live_bytes);
+    }
 }
 
 void CudaDeviceBuffer::Upload(const void* src, size_t bytes) {

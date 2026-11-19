@@ -16,7 +16,9 @@
 #include "include/cuda_ops.h"
 #include "include/cuda_quant.h"
 #include "include/cuda_tensor.h"
+#include "include/forward.h"
 #include "include/kv_cache.h"
+#include "include/loader.h"
 #include "include/ops.h"
 #include "include/quant.h"
 
@@ -259,14 +261,23 @@ void TestRuntime(int device_id) {
 
     std::vector<float> source = {1.0f, -2.5f, 3.25f, 7.0f};
     std::vector<float> output(source.size(), 0.0f);
-    CudaDeviceBuffer buffer(source.size() * sizeof(float), device_id);
-    buffer.Upload(source.data(), source.size() * sizeof(float));
-    buffer.Download(output.data(), output.size() * sizeof(float));
+    const size_t bytes = source.size() * sizeof(float);
+    CudaBufferTracker tracker(true);
+    CudaDeviceBuffer buffer(bytes, device_id);
+    buffer.Upload(source.data(), bytes);
+    buffer.Download(output.data(), bytes);
     Require(output == source, "CUDA upload/download round trip failed");
     CudaDeviceBuffer moved = std::move(buffer);
     Require(buffer.Empty() && !moved.Empty(), "CUDA buffer move failed");
     moved.Reset();
     Require(moved.Empty(), "CUDA buffer reset failed");
+    CudaSynchronizeDevice(device_id);
+    const auto stats = tracker.Snapshot();
+    Require(stats.allocations == 1 && stats.peak_bytes == bytes && stats.live_bytes == 0,
+            "CUDA buffer allocation stats mismatch after moving and resetting the buffer");
+    Require(stats.h2d_copies == 1 && stats.d2h_copies == 1 &&
+                stats.h2d_bytes == bytes && stats.d2h_bytes == bytes,
+            "CUDA buffer transfer stats mismatch");
     std::cout << "PASS runtime: " << CudaFormatDeviceInfo(info) << "\n";
 }
 
@@ -445,6 +456,167 @@ void TestCacheAndAttention(int device_id, int target_pos, int head_dim) {
               << ", head_dim=" << head_dim << "\n";
 }
 
+void TestCudaArgMax(int device) {
+    CudaDeviceBuffer workspace;
+    Tensor logits({1031}, -std::numeric_limits<float>::max());
+    CudaTensor device_logits = CudaTensorFromHost(logits, device);
+    Require(CudaArgMax(device_logits, workspace) == 0, "CUDA ArgMax all tied");
+    logits.data[256] = 5.0f;
+    logits.data[1030] = 5.0f;
+    device_logits.Upload(logits);
+    Require(CudaArgMax(device_logits, workspace) == 256, "CUDA ArgMax cross-block tie");
+    logits.data[1030] = 6.0f;
+    device_logits.Upload(logits);
+    Require(CudaArgMax(device_logits, workspace) == 1030, "CUDA ArgMax last element");
+    for (const float value : {std::numeric_limits<float>::quiet_NaN(),
+                              std::numeric_limits<float>::infinity(),
+                              -std::numeric_limits<float>::infinity()}) {
+        logits.data[5] = value;
+        device_logits.Upload(logits);
+        bool rejected = false;
+        try {
+            CudaArgMax(device_logits, workspace);
+        } catch (const std::runtime_error& error) {
+            rejected = std::string(error.what()).find("not finite") != std::string::npos;
+        }
+        Require(rejected, "CUDA ArgMax accepted a non-finite logit");
+    }
+    bool rejected = false;
+    try {
+        CudaArgMax(CudaTensor{}, workspace);
+    } catch (const std::runtime_error& error) {
+        rejected = std::string(error.what()).find("non-empty") != std::string::npos;
+    }
+    Require(rejected, "CUDA ArgMax accepted an empty logit vector");
+    std::cout << "PASS CUDA ArgMax\n";
+}
+
+Tensor CopyRows(const Tensor& matrix, int offset, int count, std::vector<int> shape) {
+    Tensor rows(shape, 0.0f);
+    std::copy_n(matrix.data.begin() + static_cast<size_t>(offset) * matrix.shape[1],
+                rows.Size(), rows.data.begin());
+    Require(rows.Size() == static_cast<size_t>(count) * matrix.shape[1], "row shape mismatch");
+    return rows;
+}
+
+void TestPrefillAttention(int device) {
+    constexpr int heads = 14;
+    constexpr int kv_heads = 2;
+    constexpr int dim = 64;
+    constexpr int first = 13;
+    constexpr int rows = 19;
+    constexpr int length = first + rows + 3;
+    const Tensor keys = Pattern({length, kv_heads * dim}, 0.15f, -0.08f);
+    const Tensor values = Pattern({length, kv_heads * dim}, 0.04f, 0.05f);
+    const Tensor queries = Pattern({rows, heads * dim}, 1.1f, 0.3f);
+    KVCache cpu_cache(2, length, kv_heads, dim);
+    CudaKVCache gpu_cache(2, length, kv_heads, dim, device);
+    for (int pos = 0; pos < length; ++pos) {
+        cpu_cache.Write(1, pos, CopyRows(keys, pos, 1, {kv_heads, dim}),
+                        CopyRows(values, pos, 1, {kv_heads, dim}));
+    }
+    const auto write_gpu_rows = [&](int pos, int count) {
+        auto k = CudaTensorFromHost(CopyRows(keys, pos, count, {count, kv_heads * dim}), device);
+        auto v = CudaTensorFromHost(CopyRows(values, pos, count, {count, kv_heads * dim}), device);
+        gpu_cache.WriteDeviceBatch(1, pos, k, v);
+    };
+    write_gpu_rows(0, first);
+    write_gpu_rows(first, length - first);
+    const Tensor actual = CudaAttentionPrefill(CudaTensorFromHost(queries, device),
+                                               gpu_cache, 1, first, heads).Download();
+    for (int row = 0; row < rows; ++row) {
+        const auto query = CopyRows(queries, row, 1, {heads, dim});
+        const auto expected = AttentionReference(query, cpu_cache, 1, first + row, heads, kv_heads, dim);
+        RequireClose(CopyRows(actual, row, 1, {heads, dim}), expected, kQuantTolerance,
+                     "causal GQA prefill with prefix and future slots");
+    }
+    Require(!CudaPrefillAttentionSupports(14, 2, 128) && !CudaPrefillAttentionSupports(18, 2, dim),
+            "unsupported CUDA prefill shape accepted");
+    std::cout << "PASS tiled causal GQA Prefill\n";
+}
+
+void TestForwardPrefill(int device) {
+    auto model = LoadModel("models/tiny/model.json", "models/tiny/model.bin");
+    Require(model.is_loaded, "tiny CUDA Prefill model load failed");
+    model.config.max_seq_len = 160;
+    model.config.rope_type = RopeType::kNeoX;
+    const int q_size = model.config.n_heads * model.config.head_dim;
+    const int kv_size = model.config.n_kv_heads * model.config.head_dim;
+    model.layers[0].bq = Pattern({q_size}, 0.001f, 0.0f);
+    model.layers[0].bk = Pattern({kv_size}, 0.002f, -0.01f);
+    model.layers[0].bv = Pattern({kv_size}, 0.001f, 0.02f);
+    UploadModelWeightsToCuda(model, device);
+    model.cuda_weights->batch_prefill_enabled = true;
+    MiniLlamaContext sequential(&model);
+    MiniLlamaContext batched(&model);
+    std::vector<int> tokens(153);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        tokens[i] = 32 + static_cast<int>(i) % 90;
+    }
+    Tensor expected;
+    for (int pos = 0; pos < 23; ++pos) {
+        expected = ForwardBatch(sequential, model, MiniBatch::GetSingleMiniBatch(tokens[pos], pos));
+    }
+    ForwardBatch(batched, model, MiniBatch::GetMultiMiniBatch(std::vector<int>(tokens.begin(), tokens.begin() + 5)));
+    Require(batched.last_batch_used_cuda_prefill, "initial CUDA Prefill did not batch");
+    auto actual = ForwardBatch(batched, model,
+        MiniBatch::GetMultiMiniBatch(std::vector<int>(tokens.begin() + 5, tokens.begin() + 23), 5));
+    Require(batched.last_batch_used_cuda_prefill && batched.pos == 22 && batched.token_history.size() == 23,
+            "CUDA Prefill did not commit the expected token prefix");
+    RequireClose(actual, expected, kQuantTolerance, "CUDA Prefill final logits");
+    for (int layer = 0; layer < model.config.n_layers; ++layer) {
+        for (int pos : {0, 4, 5, 22}) {
+            RequireClose(batched.cuda_kv_cache_.ReadKey(layer, pos),
+                         sequential.cuda_kv_cache_.ReadKey(layer, pos), kQuantTolerance, "batched key");
+            RequireClose(batched.cuda_kv_cache_.ReadValue(layer, pos),
+                         sequential.cuda_kv_cache_.ReadValue(layer, pos), kQuantTolerance, "batched value");
+        }
+    }
+    const auto decode = MiniBatch::GetSingleMiniBatch(tokens[23], 23);
+    RequireClose(ForwardBatch(batched, model, decode), ForwardBatch(sequential, model, decode),
+                 kQuantTolerance, "Decode after CUDA Prefill");
+    Require(!batched.last_batch_used_cuda_prefill, "single token did not fall back");
+
+    auto chunks = ForwardBatch(batched, model, MiniBatch::GetMultiMiniBatch(std::vector<int>(tokens.begin() + 24, tokens.end()), 24));
+    Require(batched.last_batch_used_cuda_prefill && batched.token_history == tokens,
+            "chunked CUDA Prefill did not commit the whole suffix");
+    ForwardBatch(sequential, model, MiniBatch::GetMultiMiniBatch(std::vector<int>(tokens.begin() + 24, tokens.end() - 1), 24));
+    RequireClose(chunks, ForwardBatch(sequential, model, MiniBatch::GetSingleMiniBatch(tokens.back(), 152)),
+                 kQuantTolerance, "Prefill across a 128-token chunk boundary");
+
+    for (const auto& bad : {
+            MiniBatch::GetMultiMiniBatch({1, model.config.vocab_size}, 153),
+            MiniBatch::GetMultiMiniBatch(std::vector<int>(8, 1), 153)}) {
+        bool rejected = false;
+        try {
+            ForwardBatch(batched, model, bad);
+        } catch (const std::out_of_range&) {
+            rejected = true;
+        }
+        Require(rejected && batched.pos == 152 && batched.token_history == tokens,
+                "invalid batch advanced the CUDA prefix");
+    }
+    MiniLlamaContext noncontiguous(&model);
+    ForwardBatch(noncontiguous, model, MiniBatch{{1, 2}, {0, 2}});
+    Require(!noncontiguous.last_batch_used_cuda_prefill && noncontiguous.cuda_valid_prefix == 1,
+            "noncontiguous CUDA batch should use the compatibility path");
+
+    const auto norm = std::find_if(model.cuda_weights->weights.begin(), model.cuda_weights->weights.end(),
+                                   [](const auto& weight) { return weight.name == "layers.1.attention_norm"; });
+    Require(norm != model.cuda_weights->weights.end(), "test norm weight unavailable");
+    ++norm->shape[0];
+    bool failed = false;
+    try {
+        ForwardBatch(batched, model, MiniBatch::GetMultiMiniBatch({1, 2}, 153));
+    } catch (const std::runtime_error& error) {
+        failed = std::string(error.what()).find("weight shape") != std::string::npos;
+    }
+    Require(failed && batched.token_history.empty() && batched.cuda_kv_cache_.Empty() &&
+                batched.cuda_valid_prefix == 0,
+            "failed CUDA Prefill left a reusable partially-written prefix");
+    std::cout << "PASS CUDA Prefill, KV parity, chunking and cache invalidation\n";
+}
+
 }  // namespace
 }  // namespace mini_llama
 
@@ -460,6 +632,9 @@ int main(int argc, char** argv) {
         mini_llama::TestMatmulAndOps(device_id);
         mini_llama::TestRope(device_id);
         mini_llama::TestQuant(device_id);
+        mini_llama::TestCudaArgMax(device_id);
+        mini_llama::TestPrefillAttention(device_id);
+        mini_llama::TestForwardPrefill(device_id);
         for (int head_dim : {7, 128, 129}) {
             for (int pos : {0, 4, 126, 127, 128, 256}) {
                 mini_llama::TestCacheAndAttention(device_id, pos, head_dim);

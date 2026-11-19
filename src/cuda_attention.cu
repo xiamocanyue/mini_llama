@@ -179,7 +179,102 @@ __global__ void AttentionReduceKernel(const float* score, const float* value, fl
 		out[static_cast<size_t>(head) * static_cast<size_t>(head_dim) + static_cast<size_t>(i)] = v;
 	}
 }
+constexpr int kPrefillTile = 16;
+constexpr int kPrefillHeadLimit = 64;
+
+// One block reads a KV tile for all query heads in a GQA group at one position.
+__global__ void AttentionPrefillKernel(const float* query, const float* keys, const float* values,
+                                      float* output, int layer, int start_pos, int cache_length,
+                                      int n_heads, int n_kv_heads, int head_dim, int group_size,
+                                      float scale) {
+    __shared__ float key_tile[kPrefillTile * kPrefillHeadLimit];
+    __shared__ float value_tile[kPrefillTile * kPrefillHeadLimit];
+
+    const int row = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int lane = threadIdx.x % warpSize;
+    const int head = kv_head * group_size + threadIdx.x / warpSize;
+    const size_t q_offset = (static_cast<size_t>(row) * n_heads + head) * head_dim;
+    const int upper_col = lane + warpSize;
+    const float q_lo = lane < head_dim ? query[q_offset + lane] : 0.0f;
+    const float q_hi = upper_col < head_dim ? query[q_offset + upper_col] : 0.0f;
+
+    float running_max = -INFINITY;
+    float normalizer = 0.0f;
+    float acc_lo = 0.0f;
+    float acc_hi = 0.0f;
+    const int visible = start_pos + row + 1;
+    const size_t layer_offset = static_cast<size_t>(layer) * cache_length;
+    for (int begin = 0; begin < visible;) {
+        const int count = min(kPrefillTile, visible - begin);
+        for (int item = threadIdx.x; item < count * head_dim; item += blockDim.x) {
+            const size_t pos = layer_offset + begin + item / head_dim;
+            const size_t offset = (pos * n_kv_heads + kv_head) * head_dim + item % head_dim;
+            key_tile[item] = keys[offset];
+            value_tile[item] = values[offset];
+        }
+        __syncthreads();
+
+        for (int i = 0; i < count; ++i) {
+            const int base = i * head_dim;
+            float dot = lane < head_dim ? q_lo * key_tile[base + lane] : 0.0f;
+            if (upper_col < head_dim) {
+                dot += q_hi * key_tile[base + upper_col];
+            }
+            for (int delta = warpSize / 2; delta > 0; delta /= 2) {
+                dot += __shfl_down_sync(0xffffffffu, dot, delta);
+            }
+            const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
+            const float next_max = fmaxf(running_max, score);
+            const float previous_scale = expf(running_max - next_max);
+            const float weight = expf(score - next_max);
+            normalizer = normalizer * previous_scale + weight;
+            if (lane < head_dim) {
+                acc_lo = acc_lo * previous_scale + weight * value_tile[base + lane];
+            }
+            if (upper_col < head_dim) {
+                acc_hi = acc_hi * previous_scale + weight * value_tile[base + upper_col];
+            }
+            running_max = next_max;
+        }
+        __syncthreads();
+        begin += count;
+    }
+    if (lane < head_dim) {
+        output[q_offset + lane] = acc_lo / normalizer;
+    }
+    if (upper_col < head_dim) {
+        output[q_offset + upper_col] = acc_hi / normalizer;
+    }
+}
 } // namespace
+
+CudaTensor CudaAttentionPrefill(const CudaTensor& q, const CudaKVCache& kv_cache,
+                               int layer, int start_pos, int n_heads) {
+    const int n_kv_heads = kv_cache.GetNKVHeads();
+    const int head_dim = kv_cache.GetHeadDim();
+    const int cache_length = kv_cache.GetMaxSeqLen();
+    const int device = kv_cache.GetDeviceId();
+    const auto shape = q.Shape();
+    if (!CudaPrefillAttentionSupports(n_heads, n_kv_heads, head_dim) || n_kv_heads > 65535 ||
+        kv_cache.Empty() || q.Empty() || q.GetDeviceId() != device ||
+        shape.size() != 2 || static_cast<size_t>(shape[1]) != static_cast<size_t>(n_heads) * head_dim ||
+        layer < 0 || layer >= kv_cache.GetNLayers() || start_pos < 0 || start_pos >= cache_length ||
+        shape[0] > cache_length - start_pos) {
+        throw std::invalid_argument("CudaAttentionPrefill: invalid shape, device, or window");
+    }
+
+    CudaSetDevice(device);
+    CudaTensor output(shape, device);
+    const int group_size = n_heads / n_kv_heads;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    AttentionPrefillKernel<<<dim3(shape[0], n_kv_heads), group_size * 32>>>(
+        static_cast<const float*>(q.GetData()), static_cast<const float*>(kv_cache.GetKeyData()),
+        static_cast<const float*>(kv_cache.GetValueData()), static_cast<float*>(output.GetData()),
+        layer, start_pos, cache_length, n_heads, n_kv_heads, head_dim, group_size, scale);
+    CheckCudaAttention(cudaGetLastError(), "AttentionPrefillKernel");
+    return output;
+}
 
 Tensor CudaAttentionDecode(const Tensor& q, const CudaKVCache& kv_cache, int layer, 
 					int pos, int max_seq_len, int n_heads, int n_kv_heads, int head_dim, int device_id) {

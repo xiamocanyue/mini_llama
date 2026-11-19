@@ -6,6 +6,9 @@
 namespace mini_llama {
 
 bool CheckCudaAttentionBuilt();
+bool CudaPrefillAttentionSupports(int n_heads, int n_kv_heads, int head_dim);
+CudaTensor CudaAttentionPrefill(const CudaTensor& q, const CudaKVCache& kv_cache,
+                               int layer, int start_pos, int n_heads);
 
 Tensor CudaAttentionDecode(const Tensor& q, const CudaKVCache& kv_cache, int layer, 
 					int pos, int max_seq_len, int n_heads, int n_kv_heads, int head_dim, int device_id = 0);

@@ -24,6 +24,9 @@ struct MiniLlamaContext {
     
     KVCache kv_cache;
 	CudaKVCache cuda_kv_cache_;
+    CudaDeviceBuffer cuda_argmax_workspace;
+    bool last_batch_used_cuda_prefill = false;
+    int cuda_valid_prefix = 0;
     //pos用来定位当前处理的token在上下文中的绝对位置
     //定位kv_cache中的写入位置
     //定位RoPE的位置编码

@@ -13,6 +13,8 @@ struct SamplerParams {
     unsigned int seed = 0;   // 0 表示用系统的seed
 };
 
+bool UseGreedySampling(const SamplerParams& params);
+
 class MiniSampler {
 public:
     explicit MiniSampler(unsigned int seed = 0);

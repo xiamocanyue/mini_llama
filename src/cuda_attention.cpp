@@ -15,7 +15,16 @@ bool CheckCudaAttentionBuilt() {
 #endif
 }
 
+bool CudaPrefillAttentionSupports(int n_heads, int n_kv_heads, int head_dim) {
+    return n_heads > 0 && n_kv_heads > 0 && n_heads % n_kv_heads == 0 &&
+           n_heads / n_kv_heads <= 8 && head_dim > 0 && head_dim <= 64;
+}
+
 #ifndef MINI_LLAMA_USE_CUDA
+CudaTensor CudaAttentionPrefill(const CudaTensor&, const CudaKVCache&, int, int, int) {
+    throw CudaAttentionNotBuilt();
+}
+
 Tensor CudaAttentionDecode(const Tensor& q, const CudaKVCache& kv_cache, int layer,
 						int pos, int max_seq_len, int n_heads, int n_kv_heads,
 						int head_dim, int device_id) {

@@ -154,6 +154,32 @@ void CudaKVCache::Write(int layer, int pos, const Tensor& k, const Tensor& v) {
 #endif	
 }
 
+void CudaKVCache::WriteDeviceBatch(int layer, int start_pos, const CudaTensor& k, const CudaTensor& v) {
+#ifdef MINI_LLAMA_USE_CUDA
+    ValidateIndices(layer, start_pos);
+    const auto shape = k.Shape();
+    const auto row_size = static_cast<size_t>(n_kv_heads_) * head_dim_;
+    if (k.Empty() || v.Empty() || k.GetDeviceId() != device_id_ || v.GetDeviceId() != device_id_ ||
+        shape.size() != 2 || static_cast<size_t>(shape[1]) != row_size || shape != v.Shape() ||
+        shape[0] > max_seq_len_ - start_pos) {
+        throw std::invalid_argument("CudaKVCache::WriteDeviceBatch: invalid shape, device, or window");
+    }
+
+    const size_t offset = SlotOffsetBytes(layer, start_pos);
+    CudaSetDevice(device_id_);
+    CudaMemcpyBytes(static_cast<char*>(keys_.GetData()) + offset, k.GetData(),
+                    k.GetBytes(), MemcpyKind::kDeviceToDevice);
+    CudaMemcpyBytes(static_cast<char*>(values_.GetData()) + offset, v.GetData(),
+                    v.GetBytes(), MemcpyKind::kDeviceToDevice);
+#else
+    (void)layer;
+    (void)start_pos;
+    (void)k;
+    (void)v;
+    throw CudaKVCacheNotBuilt();
+#endif
+}
+
 void CudaKVCache::WriteDevice(int layer, int pos, const CudaTensor& k, const CudaTensor& v) {
 #ifdef MINI_LLAMA_USE_CUDA
 	ValidateIndices(layer, pos);

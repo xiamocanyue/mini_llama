@@ -97,6 +97,49 @@ GPU 脚本强制重新编译，实时显示输出并记录 attention 源码 SHA-
 
 结果保存在 `result/Final_result.md`、`Cpu_result.md`、`Gpu_result.md`，阶段日志包括真实 GGUF 生成、memcheck、racecheck 和 synccheck（`04-real-gguf-generate.log` 至 `08-compute-sanitizer-synccheck.log`），总运行输出为 `Cpu_runner.log` 和 `Gpu_runner.log`。某阶段失败会阻断后续 GPU 阶段。
 
+### Colab T4 推理优化实测（2026-11-19）
+
+在同一台 Colab Tesla T4（15 GiB、CUDA Toolkit 13.0、Release / sm_75）上，以同一份 `Qwen2-0.5B-Instruct-Q8_0.gguf`、同一二进制和固定种子对照。两项开关均关闭作为基线，共采集 **210 条热态样本**。模型加载和请求上下文初始化单独计时，推理总耗时为首 token 时间与后续 Decode 时间之和。
+
+- `MINI_LLAMA_CUDA_BATCH_PREFILL=1` 按最多 128 个连续 token 分块执行提示词前向，只对提示词的最后一个位置计算 logits。
+- `MINI_LLAMA_CUDA_GREEDY=1` 在设备端取最大 logits 的索引。两项优化默认关闭。
+
+#### 短提示词四批对照
+
+使用中文提示词「你好，请用一句话介绍自己。」，输入 7 个 token，生成 8 个 token，实际 Decode 7 步。每种配置测 4 批，每批 8 次，轮换测试顺序。下表单位为毫秒。
+
+| 开关组合 | Prefill p50 | Prefill p95 | 首 token p50 | Decode p50 | 推理总耗时 p50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 逐 token + CPU 采样 | 182.13 | 195.23 | 182.56 | 185.02 | 368.09 |
+| 仅批量 Prefill | 60.97 | 63.60 | 61.42 | 188.49 | 249.89 |
+| 仅 GPU 贪心 | 181.78 | 199.67 | 181.82 | 179.39 | 361.55 |
+| 两项同时开启 | 60.57 | 63.32 | 60.62 | 182.80 | 243.59 |
+
+批量 Prefill 单开时，Prefill 中位耗时从 **182.13 ms** 降到 **60.97 ms**，约 **2.99 倍**。两项同时开启时，首 token 中位耗时从 **182.56 ms** 降到 **60.62 ms**，推理总耗时下降 **33.82%**。
+
+#### 不同输入长度的 Prefill
+
+使用指定数量的 BOS token 构造输入，生成 1 个 token 即结束。每行比较逐 token 与批量 Prefill 的中位耗时，两组都用 CPU 采样。1024-token 每组仅测 3 次，真实长提示词和多轮聊天的性能仍待验证。
+
+| 输入 token | 每组样本 | 逐 token（ms） | 批量（ms） | 加速 |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 8 | 414.26 | 122.44 | 3.38× |
+| 128 | 6 | 3424.46 | 969.20 | 3.53× |
+| 512 | 4 | 13998.77 | 3863.21 | 3.62× |
+| 1024 | 3 | 29037.64 | 7870.31 | 3.69× |
+
+#### GPU 贪心对 Decode 的影响
+
+固定同一条短提示词，关闭批量 Prefill，对比后续 Decode 的阶段中位耗时。GPU 贪心每步从设备回传的数据由 **607,744 字节**降到 **4 字节**，实测 Decode 耗时下降约 **2%–3%**。64 步配置约 **38.7 tokens/s**。当前实现仍需计算完整的词表 logits，现有阶段计时无法区分 Attention、FFN 与输出层各自的耗时。
+
+| Decode 步数 | 每组样本 | CPU 采样（ms） | GPU 贪心（ms） | 耗时下降 |
+| ---: | ---: | ---: | ---: | ---: |
+| 7 | 32 | 185.02 | 179.39 | 3.04% |
+| 32 | 10 | 845.56 | 829.74 | 1.87% |
+| 64 | 10 | 1701.09 | 1651.83 | 2.90% |
+
+各对照组在相同输入下生成的 token ID 一致。另一次真实 Qwen2 短提示验证中，8 组固定输入的逐 token 与批量 CUDA logits 最大绝对误差为 `8.08239e-05`，两项开启的短生成通过 Compute Sanitizer memcheck（0 错误）。逐批中位数、测试口径和本地原始数据索引保存在本地的 `Record.md` 和 `result/` 中。
+
 ### 4090D 实测结果
 
 本节同时包含 tiny kernel 回归和真实 Qwen2 GGUF 结果。tiny 主要验证 CUDA kernel 与数值对齐；Qwen2 结果用于展示真实模型的加载、生成和 CPU/GPU 方向性差异。
@@ -127,8 +170,9 @@ GPU 脚本强制重新编译，实时显示输出并记录 attention 源码 SHA-
 | Prefill | 24886.374 ms / **0.2815 tokens/s** | 875.680 ms / **7.99 tokens/s** | **28.38x** |
 | Decode | 14086.460 ms / **0.4969 tokens/s** | 128.014 ms / **54.68 tokens/s** | **110.04x** |
 
+这是历史单次冷运行。CPU 和 GPU 的硬件环境、线程配置均不同。旧 `generate` 将 Decode 前向与采样分开计时，CUDA KV Cache 初始化计入首轮 Prefill。上方 T4 的优化比例以同一实例的热态 `bench` 对照计算，两个测试使用各自的计时口径。
+
 
 ```bash
 python3 python/test_gpu_alignment.py --binary build-gpu/mini-llama --keep-output result/logits
 ```
-

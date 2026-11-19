@@ -47,6 +47,13 @@ void CudaRope(Tensor& q, Tensor& k, int pos, float theta, RopeType type = RopeTy
 void CudaRopeDeviceInput(CudaTensor& q, CudaTensor& k, int n_heads, int n_kv_heads, int head_dim, int pos, 
                 float theta, RopeType type = RopeType::kNormal, int device_id = 0);
 
+// Embeddings for consecutive rows and greedy selection from device logits.
+void CudaRopeDeviceBatch(CudaTensor& q, CudaTensor& k, int n_heads, int n_kv_heads, int head_dim,
+                         int start_pos, float theta, RopeType type, int device_id);
+CudaTensor CudaEmbeddingBatch(const void* embedding_data, const std::vector<int>& embedding_shape,
+                              const int* tokens, int rows, int device_id);
+int CudaArgMax(const CudaTensor& logits, CudaDeviceBuffer& workspace);
+
 CudaTensor CudaEmbedding(const void* embedding_data, const std::vector<int>& embedding_shape, int token_id, int device_id = 0);
 
 

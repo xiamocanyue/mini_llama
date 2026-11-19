@@ -23,6 +23,7 @@ public:
 	void Clear();
 
 	void Write(int layer, int pos, const Tensor& k, const Tensor& v);
+	void WriteDeviceBatch(int layer, int start_pos, const CudaTensor& k, const CudaTensor& v);
 	void WriteDevice(int layer, int pos, const CudaTensor& k, const CudaTensor& v);
 
 	Tensor ReadKey(int layer, int pos) const;

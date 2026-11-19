@@ -17,6 +17,10 @@ public:
 
     virtual int GetVocabSize() const = 0;
     virtual int GetBOSId() const = 0;
+    virtual bool HasBOS() const {
+        const int id = GetBOSId();
+        return id >= 0 && id < GetVocabSize() && !DecodeToken(id).empty();
+    }
     virtual int GetEOSId() const = 0;
     virtual int GetUNKId() const = 0;
 };
@@ -64,6 +68,9 @@ public:
     }
     int GetBOSId() const override {
         return bos_id_;
+    }
+    bool HasBOS() const override {
+        return DecodeToken(bos_id_) == "<bos>";
     }
     int GetEOSId() const override {
         return eos_id_;

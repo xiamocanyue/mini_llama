@@ -86,6 +86,11 @@ std::vector<std::pair<float, int>> GetCandidate(const Tensor& logits) {
 } // namespace
 
 
+bool UseGreedySampling(const SamplerParams& params) {
+    return std::isfinite(params.temperature) && params.temperature >= 0.0f &&
+           (params.temperature < kGreedyTemperature || params.top_k == 1);
+}
+
 MiniSampler::MiniSampler(unsigned int seed) {
     if (seed == 0) {
         std::random_device rd;
@@ -141,7 +146,7 @@ int MiniSampler::SampleTopk(const Tensor& logits, float temperature, int top_k) 
 int MiniSampler::Sample(const Tensor& logits, const SamplerParams& params) {
     ValidateLogits(logits);
     ValidateTemperature(params.temperature);
-    if (params.temperature < kGreedyTemperature || params.top_k == 1) {
+    if (UseGreedySampling(params)) {
         return SampleGreedy(logits);
     }
     if (params.top_k > 1) {

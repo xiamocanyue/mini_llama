@@ -1,5 +1,6 @@
 #pragma once 
 
+#include <cstdint>
 #include <string>
 
 namespace mini_llama {
@@ -29,6 +30,38 @@ enum class MemcpyKind {
 void* CudaMallocBytes(size_t bytes);
 void CudaFreeBytes(void* ptr);
 void CudaMemcpyBytes(void* dst, const void* src, size_t bytes, MemcpyKind kind);
+void CudaSynchronizeDevice(int device_id);
+
+struct CudaBufferStats {
+    size_t allocations = 0;
+    size_t live_bytes = 0;
+    size_t peak_bytes = 0;
+    size_t h2d_copies = 0;
+    size_t d2h_copies = 0;
+    size_t h2d_bytes = 0;
+    size_t d2h_bytes = 0;
+};
+
+// Measures buffer allocations and explicit copies on the calling thread.
+class CudaBufferTracker {
+public:
+    explicit CudaBufferTracker(bool enabled);
+    ~CudaBufferTracker();
+    CudaBufferTracker(const CudaBufferTracker&) = delete;
+    CudaBufferTracker& operator=(const CudaBufferTracker&) = delete;
+
+    CudaBufferStats Snapshot() const { return stats_; }
+    void ResetPeak() { stats_.peak_bytes = stats_.live_bytes; }
+
+private:
+    friend class CudaDeviceBuffer;
+    friend void CudaMemcpyBytes(void*, const void*, size_t, MemcpyKind);
+
+    static thread_local CudaBufferTracker* active_;
+    CudaBufferTracker* previous_ = nullptr;
+    std::uint64_t id_ = 0;
+    CudaBufferStats stats_;
+};
 
 
 class CudaDeviceBuffer {
@@ -76,6 +109,7 @@ private:
     void* data_ = nullptr;
     size_t bytes_ = 0;
     int device_id_ = 0;
+    std::uint64_t tracking_id_ = 0;
 
 
 };

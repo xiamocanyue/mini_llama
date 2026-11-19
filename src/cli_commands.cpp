@@ -8,11 +8,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -138,6 +138,10 @@ static bool PrepareCudaWeightsOrPrint(MiniLlamaModel& model,
     }
     try {
         UploadModelWeightsToCuda(model, config.device_id);
+        const char* prefill = std::getenv("MINI_LLAMA_CUDA_BATCH_PREFILL");
+        const char* greedy = std::getenv("MINI_LLAMA_CUDA_GREEDY");
+        model.cuda_weights->batch_prefill_enabled = prefill && std::strcmp(prefill, "1") == 0;
+        model.cuda_weights->device_greedy_enabled = greedy && std::strcmp(greedy, "1") == 0;
         return true;
     } catch (const std::exception& e) {
         std::cerr << "CUDA weight upload failed: " << e.what() << "\n";
@@ -777,33 +781,35 @@ static int RunGenerate(int argc, char** argv) {
 
     size_t prompt_len = tokens.size();
     int step = 0;
+    bool used_cuda_greedy = false;
     try {
-        Tensor logits;
+        SamplingLogits logits;
         std::cout << "prefill...\n";
         stage_start = RequestClock::now();
         if (!dump_logits_dir.empty()) {
             for (size_t i = 0; i < prompt_len; ++i) {
                 MiniBatch prefill_step =
                         MiniBatch::GetMultiMiniBatch({tokens[i]}, static_cast<int>(i));
-                logits = ForwardBatch(ctx, model, prefill_step);
+                logits = ForwardBatchForSampling(ctx, model, prefill_step, sampling_params, true);
                 ++ctx.n_prefill_tokens;
-                DumpLogits(logits, dump_logits_dir + "/logits_step" +
+                DumpLogits(logits.host, dump_logits_dir + "/logits_step" +
                                                               std::to_string(step) + ".bin");
                 ++step;
             }
         } else {
             MiniBatch prefill = MiniBatch::GetMultiMiniBatch(tokens, 0);
-            logits = ForwardBatch(ctx, model, prefill);
+            logits = ForwardBatchForSampling(ctx, model, prefill, sampling_params);
             ctx.n_prefill_tokens += static_cast<int>(tokens.size());
         }
         request.prefill_ms = GetUseTime(stage_start);
         request.prefill_tokens = static_cast<int>(prompt_len);
         request.RecordEvent("prefill", request.prefill_ms, request.prefill_tokens,
-                                                dump_logits_dir.empty() ? "batch" : "step_dump");
+                                                dump_logits_dir.empty() ? (ctx.last_batch_used_cuda_prefill ? "cuda_batch" : "batch") : "step_dump");
 
         if (n_predict > 0) {
             stage_start = RequestClock::now();
-            int next_token = sampler.Sample(logits, sampling_params);
+            used_cuda_greedy = !logits.device.Empty();
+            int next_token = SampleNextToken(ctx, logits, sampler, sampling_params);
             request.sample_ms += GetUseTime(stage_start);
             tokens.push_back(next_token);
 
@@ -812,7 +818,7 @@ static int RunGenerate(int argc, char** argv) {
                 MiniBatch decode_batch = MiniBatch::GetSingleMiniBatch(
                         tokens.back(), static_cast<int>(tokens.size() - 1));
                 stage_start = RequestClock::now();
-                logits = ForwardBatch(ctx, model, decode_batch);
+                logits = ForwardBatchForSampling(ctx, model, decode_batch, sampling_params, !dump_logits_dir.empty());
                 double decode_ms = GetUseTime(stage_start);
                 request.decode_ms += decode_ms;
                 request.RecordEvent("decode", decode_ms, 1,
@@ -820,12 +826,12 @@ static int RunGenerate(int argc, char** argv) {
                 ++ctx.n_decode_tokens;
                 ++request.decode_tokens;
                 if (!dump_logits_dir.empty()) {
-                    DumpLogits(logits, dump_logits_dir + "/logits_step" +
+                    DumpLogits(logits.host, dump_logits_dir + "/logits_step" +
                                                                   std::to_string(step) + ".bin");
                     ++step;
                 }
                 stage_start = RequestClock::now();
-                next_token = sampler.Sample(logits, sampling_params);
+                next_token = SampleNextToken(ctx, logits, sampler, sampling_params);
                 request.sample_ms += GetUseTime(stage_start);
                 tokens.push_back(next_token);
                 if (next_token == tokenizer->GetEOSId()) {
@@ -860,7 +866,7 @@ static int RunGenerate(int argc, char** argv) {
     std::vector<int> generated(tokens.begin() + prompt_len, tokens.end());
     request.generated_tokens = static_cast<int>(generated.size());
     request.RecordEvent("sample", request.sample_ms, request.generated_tokens,
-                                            "generated_tokens");
+                        used_cuda_greedy ? "generated_tokens, sampling=cuda_argmax" : "generated_tokens");
     request.Finish();
     std::cout << "\ngenerated tokens: [";
     for (size_t i = 0; i < generated.size(); ++i) {
@@ -1148,9 +1154,9 @@ static int RunChat(int argc, char** argv) {
             max_response = max_response_tokens;
         }
 
-        session.messages_ = candidate_messages;
         MiniSampler sampler(session.sampler_params_);
-        Tensor logits;
+        SamplingLogits logits;
+        bool used_cuda_greedy = false;
 
         auto start = std::chrono::steady_clock::now();
 
@@ -1168,36 +1174,32 @@ static int RunChat(int argc, char** argv) {
         }
         std::vector<int> new_prompt_tokens(
                 tokens.begin() + static_cast<std::ptrdiff_t>(prefix_len), tokens.end());
-        session.SetTokenHistory(tokens);
+        std::vector<int> generated_ids;
+        std::string streamed_reply;
+        int generated_count = 0;
 
-        // Prefill only the context suffix that is missing from KV cache.
-        {
+        try {
+            // Prefill only the context suffix that is missing from KV cache.
             MiniBatch prefill = MiniBatch::GetMultiMiniBatch(
                     new_prompt_tokens, static_cast<int>(prefix_len));
             stage_start = RequestClock::now();
-            logits = ForwardBatch(ctx, model, prefill);
+            logits = ForwardBatchForSampling(ctx, model, prefill, session.sampler_params_);
             request.prefill_ms = GetUseTime(stage_start);
             request.prefill_tokens = static_cast<int>(new_prompt_tokens.size());
             request.RecordEvent(
                     "prefill", request.prefill_ms, request.prefill_tokens,
                     "radix_hit=" + std::to_string(cached_prefix_len) +
-                            ", prefix_reuse=" + std::to_string(prefix_len));
+                            ", prefix_reuse=" + std::to_string(prefix_len) +
+                            (ctx.last_batch_used_cuda_prefill ? ", prefill=cuda_batch" : ""));
             ctx.n_prefill_tokens += static_cast<int>(new_prompt_tokens.size());
-        }
 
-        // Generate response
-        std::vector<int> generated_ids;
-        std::string streamed_reply;
-        int generated_count = 0;
-
-        term.PrintAssistantPrefix();
-        try {
+            term.PrintAssistantPrefix();
             for (int i = 0; i < max_response; ++i) {
                 stage_start = RequestClock::now();
-                int next_token = sampler.Sample(logits, session.sampler_params_);
+                used_cuda_greedy = !logits.device.Empty();
+                int next_token = SampleNextToken(ctx, logits, sampler, session.sampler_params_);
                 request.sample_ms += GetUseTime(stage_start);
                 tokens.push_back(next_token);
-                session.AppendToken(next_token);
                 ++generated_count;
 
                 if (next_token != tokenizer->GetEOSId()) {
@@ -1214,7 +1216,7 @@ static int RunChat(int argc, char** argv) {
                         MiniBatch::GetSingleMiniBatch(
                                 next_token, static_cast<int>(tokens.size() - 1));
                 stage_start = RequestClock::now();
-                logits = ForwardBatch(ctx, model, decode_batch);
+                logits = ForwardBatchForSampling(ctx, model, decode_batch, session.sampler_params_);
                 double decode_ms = GetUseTime(stage_start);
                 request.decode_ms += decode_ms;
                 request.RecordEvent("decode", decode_ms, 1,
@@ -1226,6 +1228,7 @@ static int RunChat(int argc, char** argv) {
                 }
             }
         } catch (const std::exception& e) {
+            ctx = MiniLlamaContext{};
             term.NewLine();
             request.SetError("Inference error: " + std::string(e.what()));
             request.Finish();
@@ -1246,12 +1249,14 @@ static int RunChat(int argc, char** argv) {
         double elapsed_ms =
                 std::chrono::duration<double, std::milli>(end - start).count();
 
+        session.messages_ = std::move(candidate_messages);
+        session.SetTokenHistory(tokens);
         session.AddMessage("assistant", assistant_reply);
         session.Record(static_cast<int>(new_prompt_tokens.size()), generated_count,
                                       elapsed_ms);
         request.generated_tokens = generated_count;
         request.RecordEvent("sample", request.sample_ms, request.generated_tokens,
-                                                "generated_tokens");
+                            used_cuda_greedy ? "generated_tokens, sampling=cuda_argmax" : "generated_tokens");
         session.RecordPrefix(session.token_history_);
         request.Finish();
         PrintRequestTrace(request);
@@ -1488,6 +1493,7 @@ static void PrintBenchUsage(const char* prog) {
             << "Usage: " << prog << " bench <model-path|dir> [options]\n"
             << "Options:\n"
             << "  -p, --prompt <str>    Input prompt text (default: \"hello\")\n"
+            << "  --prompt-tokens <N>  Use exactly N BOS tokens instead of prompt text\n"
             << "  -n, --n-predict <n>   Number of tokens to generate (default: 64)\n"
             << "  --seed <S>            Random seed (default: 0 = random)\n"
             << "  --tokenizer <path>    Path to vocab.json tokenizer file\n"
@@ -1499,6 +1505,9 @@ static void PrintBenchUsage(const char* prog) {
                   "requires -DMINI_LLAMA_CUDA=ON)\n"
             << "  --device <n>          CUDA device id for --backend cuda (default: "
                   "0)\n"
+            << "  --warmup <n>         Warm-up requests, first reported as cold in JSON (default: 0)\n"
+            << "  --repeats <n>        Measured requests using the loaded model (default: 1)\n"
+            << "  --json               Emit one benchmark_json record for automation\n"
             << "  --verbose             Print debug dumps after each step\n"
             << "  -h, --help            Show this help\n"
             << "\n"
@@ -1515,20 +1524,84 @@ static void PrintBenchUsage(const char* prog) {
                   "running on CPU\n";
 }
 
-static double BenchmarkRepeated(int warmup, int iterations,
-                                                                const std::function<void()>& fn) {
-    for (int i = 0; i < warmup; ++i) {
-        fn();
+static void WriteTokenIds(std::ostream& out, const std::vector<int>& tokens) {
+    out << '[';
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (i > 0) {
+            out << ',';
+        }
+        out << tokens[i];
     }
+    out << ']';
+}
 
-    auto start = std::chrono::steady_clock::now();
-    for (int i = 0; i < iterations; ++i) {
-        fn();
+static void WriteBenchCudaStage(std::ostream& out, const BenchmarkCudaStage& stage, size_t kv_bytes) {
+    const auto& ops = stage.ops;
+    const auto& buffers = stage.buffers;
+    out << "{\"linear_calls\":" << ops.linear_calls
+        << ",\"activation_calls\":" << ops.activation_calls
+        << ",\"attention_calls\":" << ops.attention_calls
+        << ",\"attention_cpu_fallbacks\":" << ops.attention_cpu_fallbacks
+        << ",\"kv_read_bytes\":" << ops.kv_cache_read_bytes
+        << ",\"kv_write_bytes\":" << ops.kv_cache_write_bytes
+        << ",\"allocations\":" << buffers.allocations
+        << ",\"h2d_copies\":" << buffers.h2d_copies
+        << ",\"d2h_copies\":" << buffers.d2h_copies
+        << ",\"h2d_bytes\":" << buffers.h2d_bytes
+        << ",\"d2h_bytes\":" << buffers.d2h_bytes
+        << ",\"request_buffer_peak_bytes\":" << buffers.peak_bytes
+        << ",\"workspace_peak_bytes\":" << buffers.peak_bytes - std::min(buffers.peak_bytes, kv_bytes)
+        << '}';
+}
+
+static void WriteBenchSample(std::ostream& out, const BenchmarkResult& sample, const MiniLlamaModel& model) {
+    out << "{\"prompt_tokens\":" << sample.n_prompt_tokens
+        << ",\"generated_tokens\":" << sample.n_generated_tokens
+        << ",\"decode_steps\":" << sample.n_decode_tokens
+        << ",\"cuda_batch_prefill\":" << (sample.used_cuda_batch_prefill ? "true" : "false")
+        << ",\"cuda_greedy\":" << (sample.used_cuda_greedy ? "true" : "false")
+        << ",\"context_ms\":" << sample.context_ms
+        << ",\"prefill_ms\":" << sample.prefill_ms
+        << ",\"first_token_ms\":";
+    if (sample.first_token_ms) {
+        out << *sample.first_token_ms;
+    } else {
+        out << "null";
     }
-    auto end = std::chrono::steady_clock::now();
-    double elapsed_ms =
-            std::chrono::duration<double, std::milli>(end - start).count();
-    return elapsed_ms / static_cast<double>(iterations);
+    out << ",\"decode_ms\":" << sample.decode_ms << ",\"total_ms\":" << sample.total_ms()
+        << ",\"generated_ids\":";
+    WriteTokenIds(out, sample.generated_ids);
+    out << ",\"cuda\":";
+    if (ModelHasCudaWeights(model)) {
+        const size_t request_peak = std::max({sample.cuda_kv_bytes,
+            sample.cuda_context.buffers.peak_bytes,
+            sample.cuda_prefill.buffers.peak_bytes, sample.cuda_first_sample.buffers.peak_bytes,
+            sample.cuda_decode.buffers.peak_bytes});
+        out << "{\"weight_bytes\":" << ModelCudaMemoryBytes(model)
+            << ",\"kv_cache_bytes\":" << sample.cuda_kv_bytes
+            << ",\"pool_reserved_bytes\":0"
+            << ",\"tracked_peak_bytes\":" << ModelCudaMemoryBytes(model) + request_peak
+            << ",\"context\":";
+        WriteBenchCudaStage(out, sample.cuda_context, sample.cuda_kv_bytes);
+        out << ",\"prefill\":";
+        WriteBenchCudaStage(out, sample.cuda_prefill, sample.cuda_kv_bytes);
+        out << ",\"first_sample\":";
+        if (sample.first_token_ms) {
+            WriteBenchCudaStage(out, sample.cuda_first_sample, sample.cuda_kv_bytes);
+        } else {
+            out << "null";
+        }
+        out << ",\"decode\":";
+        if (sample.n_decode_tokens > 0) {
+            WriteBenchCudaStage(out, sample.cuda_decode, sample.cuda_kv_bytes);
+        } else {
+            out << "null";
+        }
+        out << '}';
+    } else {
+        out << "null";
+    }
+    out << '}';
 }
 
 static int RunBench(int argc, char** argv) {
@@ -1546,10 +1619,15 @@ static int RunBench(int argc, char** argv) {
 
     std::string model_dir = argv[2];
     std::string prompt = "hello";
+    bool text_prompt_set = false;
+    int prompt_token_count = 0;
     int n_predict = 64;
     unsigned int seed = 0;
     std::string tokenizer_path;
     bool verbose = false;
+    bool json = false;
+    int warmup = 0;
+    int repeats = 1;
     std::string quant_type;
     int n_threads = 0;
     BackendConfig backend_config;
@@ -1559,6 +1637,12 @@ static int RunBench(int argc, char** argv) {
                   std::strcmp(argv[i], "--prompt") == 0) &&
                 i + 1 < argc) {
             prompt = argv[++i];
+            text_prompt_set = true;
+        } else if (std::strcmp(argv[i], "--prompt-tokens") == 0 && i + 1 < argc) {
+            if (!ParseIntArg(argv[++i], prompt_token_count) || prompt_token_count == 0) {
+                std::cerr << "Invalid --prompt-tokens value. Expected a positive integer.\n";
+                return 1;
+            }
         } else if ((std::strcmp(argv[i], "-n") == 0 ||
                                 std::strcmp(argv[i], "--n-predict") == 0) &&
                               i + 1 < argc) {
@@ -1593,6 +1677,18 @@ static int RunBench(int argc, char** argv) {
             }
         } else if (std::strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
+        } else if (std::strcmp(argv[i], "--json") == 0) {
+            json = true;
+        } else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
+            if (!ParseIntArg(argv[++i], warmup)) {
+                std::cerr << "Invalid --warmup value. Expected a non-negative integer.\n";
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--repeats") == 0 && i + 1 < argc) {
+            if (!ParseIntArg(argv[++i], repeats) || repeats == 0) {
+                std::cerr << "Invalid --repeats value. Expected a positive integer.\n";
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "-h") == 0 ||
                               std::strcmp(argv[i], "--help") == 0) {
             PrintBenchUsage(argv[0]);
@@ -1602,6 +1698,15 @@ static int RunBench(int argc, char** argv) {
             PrintBenchUsage(argv[0]);
             return 1;
         }
+    }
+
+    if (text_prompt_set && prompt_token_count > 0) {
+        std::cerr << "--prompt and --prompt-tokens are mutually exclusive.\n";
+        return 1;
+    }
+    if (text_prompt_set && prompt.empty()) {
+        std::cerr << "Benchmark prompt must not be empty.\n";
+        return 1;
     }
 
     if (!quant_type.empty() && quant_type != "q8_0" && quant_type != "q4_0") {
@@ -1614,7 +1719,9 @@ static int RunBench(int argc, char** argv) {
         return 1;
     }
 
+    auto stage_start = RequestClock::now();
     LoadedModel lm = LoadModelAndTokenizer(model_dir, "", tokenizer_path);
+    const double load_ms = GetUseTime(stage_start);
     if (!lm.model.is_loaded) {
         std::cerr << "Failed to load model: " << lm.model.load_error << "\n";
         return 1;
@@ -1629,28 +1736,55 @@ static int RunBench(int argc, char** argv) {
         return 1;
     }
 
-    MiniLlamaModel baseline_model = lm.model;
     MiniLlamaModel& model = lm.model;
-    std::unique_ptr<ITokenizer>& tokenizer = lm.tokenizer;
-    std::vector<int> tokens = tokenizer->Encode(prompt);
-    if (tokens.size() > static_cast<size_t>(model.config.max_seq_len)) {
+    const auto& tokenizer = *lm.tokenizer;
+    if (prompt_token_count > model.config.max_seq_len) {
         std::cerr << "Prompt too long.\n";
         return 1;
     }
-    if (tokens.size() + static_cast<size_t>(n_predict) >
-            static_cast<size_t>(model.config.max_seq_len)) {
-        n_predict = model.config.max_seq_len - static_cast<int>(tokens.size());
+    std::vector<int> tokens;
+    if (prompt_token_count > 0) {
+        const int bos = tokenizer.GetBOSId();
+        if (!tokenizer.HasBOS() || bos >= model.config.vocab_size) {
+            std::cerr << "--prompt-tokens requires a valid tokenizer BOS token ID.\n";
+            return 1;
+        }
+        tokens.assign(prompt_token_count, bos);
+    } else {
+        tokens = tokenizer.Encode(prompt);
     }
+    if (tokens.empty() || model.config.max_seq_len <= 0 ||
+        tokens.size() > static_cast<size_t>(model.config.max_seq_len)) {
+        std::cerr << "Prompt is empty after tokenization or exceeds the context window.\n";
+        return 1;
+    }
+    const int effective_predict = std::min(n_predict, model.config.max_seq_len - static_cast<int>(tokens.size()));
 
+    std::optional<MiniLlamaModel> baseline_model;
+    if (!quant_type.empty() && !json) {
+        baseline_model = model;
+    }
+    stage_start = RequestClock::now();
     try {
         ApplyQuantOverride(model, quant_type);
     } catch (const std::exception& e) {
         std::cerr << "Quantization failed: " << e.what() << "\n";
         return 1;
     }
+    const double quantize_ms = GetUseTime(stage_start);
+    stage_start = RequestClock::now();
     if (!PrepareCudaWeightsOrPrint(model, backend_config)) {
         return 1;
     }
+    if (ModelHasCudaWeights(model)) {
+        try {
+            CudaSynchronizeDevice(backend_config.device_id);
+        } catch (const std::exception& e) {
+            std::cerr << "CUDA weight upload failed: " << e.what() << "\n";
+            return 1;
+        }
+    }
+    const double upload_ms = GetUseTime(stage_start);
 
     std::cout << "Benchmark: " << model_dir << "\n";
     std::cout << "  backend: " << BackendKindName(backend_config.kind) << "\n";
@@ -1659,10 +1793,13 @@ static int RunBench(int argc, char** argv) {
                             << "\n";
     }
     std::cout << "  " << BackendExecutionNote(backend_config) << "\n";
-    std::cout << "  prompt: \"" << prompt << "\" (" << tokens.size()
-                        << " tokens)\n";
+    if (prompt_token_count > 0) {
+        std::cout << "  prompt: " << tokens.size() << " BOS tokens\n";
+    } else {
+        std::cout << "  prompt: \"" << prompt << "\" (" << tokens.size() << " tokens)\n";
+    }
     SetThreadCount(n_threads);
-    std::cout << "  n_predict: " << n_predict << "\n";
+    std::cout << "  n_predict: " << effective_predict << "\n";
     std::cout << "  seed: " << seed << "\n";
     std::cout << "  quant: " << (quant_type.empty() ? "model-native" : quant_type)
                         << "\n";
@@ -1673,19 +1810,87 @@ static int RunBench(int argc, char** argv) {
         std::cout << "\n";
     }
 
-    BenchmarkResult result =
-            RunBenchmark(model, tokens, n_predict, seed, verbose);
+    std::optional<BenchmarkResult> cold;
+    std::vector<BenchmarkResult> results;
+    try {
+        if (warmup > 0) {
+            cold = RunBenchmark(model, tokens, effective_predict, seed, false);
+        }
+        for (int i = 1; i < warmup; ++i) {
+            RunBenchmark(model, tokens, effective_predict, seed, false);
+        }
+        for (int i = 0; i < repeats; ++i) {
+            results.push_back(RunBenchmark(model, tokens, effective_predict, seed, verbose));
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Benchmark failed: " << e.what() << "\n";
+        return 1;
+    }
+    if (json) {
+        const auto counts = ModelLinearWeightTypeCounts(model);
+        std::ostringstream out;
+        out << std::setprecision(17) << "benchmark_json: {\"version\":1,\"backend\":\""
+            << BackendKindName(backend_config.kind) << "\",\"threads\":" << GetThreadCount()
+            << ",\"device\":";
+        if (ModelHasCudaWeights(model)) {
+            out << backend_config.device_id;
+        } else {
+            out << "null";
+        }
+        const auto& first = results.front();
+        std::string inference_path = "cpu_sequential";
+        if (ModelHasCudaWeights(model)) {
+            inference_path = first.used_cuda_batch_prefill ? "cuda_batched" : "cuda_sequential";
+            inference_path += first.used_cuda_greedy ? "_device_argmax" : "_host_logits";
+        }
+        out << ",\"seed\":" << seed << ",\"temperature\":0,\"top_k\":0"
+            << ",\"inference_path\":\"" << inference_path
+            << "\",\"requested_predict\":" << n_predict << ",\"effective_predict\":" << effective_predict
+            << ",\"context_window\":" << model.config.max_seq_len << ",\"warmup\":" << warmup
+            << ",\"setup\":{\"load_model_and_tokenizer_ms\":" << load_ms
+            << ",\"quantize_ms\":" << quantize_ms << ",\"weight_upload_ms\":" << upload_ms << '}'
+            << ",\"linear_weight_types\":{\"f32\":" << counts.f32 << ",\"q8_0\":" << counts.q8_0
+            << ",\"q4_0\":" << counts.q4_0 << ",\"q4_1\":" << counts.q4_1 << '}'
+            << ",\"prompt_ids\":";
+        WriteTokenIds(out, tokens);
+        out << ",\"cold_sample\":";
+        if (cold) {
+            WriteBenchSample(out, *cold, model);
+        } else {
+            out << "null";
+        }
+        out << ",\"samples\":[";
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (i > 0) {
+                out << ',';
+            }
+            WriteBenchSample(out, results[i], model);
+        }
+        out << "]}\n";
+        std::cout << out.str();
+        return 0;
+    }
+
+    const BenchmarkResult& result = results.front();
 
     std::cout << "Results:\n";
+    if (repeats > 1) {
+        std::cout << "  displaying the first of " << repeats << " measured requests (use --json for all)\n";
+    }
     std::cout << "  prompt tokens:     " << result.n_prompt_tokens << "\n";
     std::cout << "  generated tokens:  " << result.n_generated_tokens << "\n";
     std::cout << "  Decode tokens:     " << result.n_decode_tokens << "\n";
     std::cout << "  prefill time:      " << std::fixed << std::setprecision(2)
                         << result.prefill_ms << " ms\n";
+    if (result.first_token_ms) {
+        std::cout << "  first token time:  " << *result.first_token_ms << " ms\n";
+    } else {
+        std::cout << "  first token time:  n/a\n";
+    }
     std::cout << "  Decode time:       " << std::fixed << std::setprecision(2)
                         << result.decode_ms << " ms\n";
     std::cout << "  total time:        " << std::fixed << std::setprecision(2)
-                        << (result.prefill_ms + result.decode_ms) << " ms\n";
+                        << result.total_ms() << " ms\n";
     std::cout << "  tokens/s (total):  " << std::fixed << std::setprecision(2)
                         << result.tokens_per_sec() << "\n";
     std::cout << "  tokens/s (Decode): " << std::fixed << std::setprecision(2)
@@ -1709,9 +1914,9 @@ static int RunBench(int argc, char** argv) {
         PrintCudaRuntimeSummary(model, "    ");
     }
 
-    if (!quant_type.empty()) {
+    if (baseline_model) {
         try {
-            Tensor baseline_logits = RunLogitsForTokens(baseline_model, tokens);
+            Tensor baseline_logits = RunLogitsForTokens(*baseline_model, tokens);
             Tensor quant_logits = RunLogitsForTokens(model, tokens);
             auto [max_err, mean_err] = LogitsError(baseline_logits, quant_logits);
 

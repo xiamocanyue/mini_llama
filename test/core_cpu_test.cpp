@@ -305,7 +305,11 @@ void TestRequestAndBackend() {
 
   BackendConfig cpu;
   ValidateBackend(cpu);
+#ifdef MINI_LLAMA_USE_CUDA
+  Expect(CudaBackendBuilt(), "CUDA build does not report CUDA support");
+#else
   Expect(!CudaBackendBuilt(), "CPU build unexpectedly reports CUDA support");
+#endif
   cpu.device_id_set = true;
   ExpectThrows([&] { ValidateBackend(cpu); },
                "CPU backend accepted a CUDA device id");

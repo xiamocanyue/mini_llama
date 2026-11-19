@@ -1,6 +1,9 @@
 #include "include/cuda_ops.h"
 
 #include <cuda_runtime_api.h>
+#include <algorithm>
+#include <cfloat>
+#include <climits>
 
 
 #include "include/cuda_data.h"
@@ -32,6 +35,38 @@ __global__ void RmsNormKernel(const float* x, const float* weight, float* y, con
     if (i < n) {
         float scale = rsqrt((*sum / static_cast<float>(n)) + eps);
         y[i] = x[i] * scale * weight[i];
+    }
+}
+
+__global__ void RmsNormRowsKernel(const float* x, const float* weight, float* y,
+                                   int cols, float eps) {
+    __shared__ float partial[kBlockSize];
+    const size_t base = static_cast<size_t>(blockIdx.x) * cols;
+    const int lane = threadIdx.x;
+    float sum = 0.0f;
+    for (int col = lane; col < cols; col += blockDim.x) {
+        const float value = x[base + col];
+        sum += value * value;
+    }
+    partial[lane] = sum;
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        __syncthreads();
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+    }
+    __syncthreads();
+    const float scale = rsqrtf(partial[0] / static_cast<float>(cols) + eps);
+    for (int col = lane; col < cols; col += blockDim.x) {
+        y[base + col] = x[base + col] * scale * weight[col];
+    }
+}
+
+__global__ void AddRowBiasKernel(const float* x, const float* bias, float* y,
+                                 int cols, size_t size) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < size) {
+        y[index] = x[index] + bias[index % cols];
     }
 }
 
@@ -129,7 +164,8 @@ __global__ void RopeNormalKernel(float* x, int n_heads, int head_dim, int pos, f
     int head_index = pair_index / head_have_pairs;
     int pair_in_head = pair_index % head_have_pairs;
     int num_index = pair_in_head * 2;
-    int base = head_index * head_dim + num_index;
+    size_t base = (static_cast<size_t>(blockIdx.y) * n_heads + head_index) * head_dim + num_index;
+    pos += blockIdx.y;
 
     float freq = 1.0f / powf(theta, static_cast<float>(num_index) / static_cast<float>(head_dim));
     float cos_val = cosf(static_cast<float>(pos) * freq);
@@ -152,7 +188,8 @@ __global__ void RopeNeoXKernel(float* x, int n_heads, int head_dim, int pos, flo
 
     int head_index = pair_index / head_have_pairs;
     int pair_in_head = pair_index % head_have_pairs;
-    int base = head_index * head_dim;
+    size_t base = (static_cast<size_t>(blockIdx.y) * n_heads + head_index) * head_dim;
+    pos += blockIdx.y;
 
     float freq = 1.0f / powf(theta, static_cast<float>(2 * pair_in_head) / static_cast<float>(head_dim));
     float cos_val = cosf(static_cast<float>(pos) * freq);
@@ -168,6 +205,64 @@ __global__ void EmbeddingLookUpKernel(const float* embedding, float* y, int toke
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < dim) {
         y[i] = embedding[token_id * dim + i];
+    }
+}
+
+__global__ void EmbeddingBatchKernel(const float* embedding, const int* tokens, float* y, int dim) {
+    const size_t row = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < dim) {
+        y[row * dim + col] = embedding[static_cast<size_t>(tokens[row]) * dim + col];
+    }
+}
+
+struct ArgMaxCandidate {
+    float score;
+    int id;
+};
+
+__device__ ArgMaxCandidate BestCandidate(ArgMaxCandidate a, ArgMaxCandidate b) {
+    if (a.id < 0 || b.id < 0) {
+        return {0.0f, -1};
+    }
+    return (b.score > a.score || (b.score == a.score && b.id < a.id)) ? b : a;
+}
+
+__device__ ArgMaxCandidate ReduceArgMax(ArgMaxCandidate value, ArgMaxCandidate* partial) {
+    const int lane = threadIdx.x;
+    partial[lane] = value;
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        __syncthreads();
+        if (lane < stride) {
+            partial[lane] = BestCandidate(partial[lane], partial[lane + stride]);
+        }
+    }
+    return partial[lane];
+}
+
+__global__ void ArgMaxBlocksKernel(const float* logits, int size, ArgMaxCandidate* block_results) {
+    __shared__ ArgMaxCandidate partial[kBlockSize];
+    ArgMaxCandidate best{-FLT_MAX, INT_MAX};
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < static_cast<size_t>(size); index += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const float score = logits[index];
+        best = BestCandidate(best, {score, isfinite(score) ? static_cast<int>(index) : -1});
+    }
+    const auto winner = ReduceArgMax(best, partial);
+    if (threadIdx.x == 0) {
+        block_results[blockIdx.x] = winner;
+    }
+}
+
+__global__ void ArgMaxResultKernel(const ArgMaxCandidate* block_results, int blocks, int* result) {
+    __shared__ ArgMaxCandidate partial[kBlockSize];
+    ArgMaxCandidate best{-FLT_MAX, INT_MAX};
+    for (int index = threadIdx.x; index < blocks; index += blockDim.x) {
+        best = BestCandidate(best, block_results[index]);
+    }
+    const auto winner = ReduceArgMax(best, partial);
+    if (threadIdx.x == 0) {
+        *result = winner.id;
     }
 }
 
@@ -273,11 +368,14 @@ void ValidateRmsNormInput(const Tensor& x, const Tensor& weight, float eps, int 
 }
 
 void ValidateRmsNormDeviceWeightInput(const CudaTensor& x, const void* weight, const std::vector<int>& weight_shape, float eps, int device_id) {
-    Check1D(x, "CudaRmsNormDeviceWeightInput");
+    const auto shape = x.Shape();
+    if (x.Empty() || (shape.size() != 1 && shape.size() != 2)) {
+        throw std::runtime_error("CudaRmsNormDeviceWeightInput: expected a vector or matrix");
+    }
     if (weight == nullptr) {
         throw std::runtime_error("CudaRmsNormDeviceWeightInput: weight is empty");
     }
-    if (x.Shape() != weight_shape) {
+    if (weight_shape != std::vector<int>{shape.back()}) {
         throw std::runtime_error("CudaRmsNormDeviceWeightInput: shape is not match");
     }
     if (x.GetDeviceId() != device_id) {
@@ -295,7 +393,9 @@ void ValidateAddDeviceWeightInput(const CudaTensor& a, const void* data, const s
     if (data == nullptr) {
         throw std::runtime_error("CudaAddDeviceWeightInput: data is empty");
     }
-    if (a.Shape() != data_shape) {
+    const auto shape = a.Shape();
+    if (shape != data_shape &&
+        !(shape.size() == 2 && data_shape == std::vector<int>{shape[1]})) {
         throw std::runtime_error("CudaAddDeviceWeightInput: input and weight is not match");
     }
 }
@@ -342,7 +442,15 @@ CudaTensor CudaRmsNormDeviceWeight(const CudaTensor& x, const void* weight_data,
     ValidateRmsNormDeviceWeightInput(x, weight_data, weight_shape, eps, device_id);
     CudaSetDevice(device_id);
 
-    CudaTensor y(x.Shape(), device_id);
+    const auto shape = x.Shape();
+    CudaTensor y(shape, device_id);
+    if (shape.size() == 2) {
+        RmsNormRowsKernel<<<shape[0], kBlockSize>>>(static_cast<const float*>(x.GetData()),
+            static_cast<const float*>(weight_data), static_cast<float*>(y.GetData()), shape[1], eps);
+        CheckLastKernelError("RmsNormRowsKernel");
+        return y;
+    }
+
     CudaDeviceBuffer sum_dev(sizeof(float), device_id);
     CheckCudaOps(cudaMemset(sum_dev.GetData(), 0, sizeof(float)), "CudaMemset(sum)");
     int n = static_cast<int>(x.GetSize());
@@ -447,7 +555,13 @@ CudaTensor CudaElementAddDeviceWeight(const CudaTensor& a, const void* b_data, c
     CudaTensor y(a.Shape(), device_id);
     int n = static_cast<int>(a.GetSize());
 
-    ElementAddKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(a.GetData()), static_cast<const float*>(b_data), static_cast<float*>(y.GetData()), n);
+    if (a.GetDimNum() == 2 && b_shape.size() == 1) {
+        AddRowBiasKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(a.GetData()),
+            static_cast<const float*>(b_data), static_cast<float*>(y.GetData()), b_shape[0], a.GetSize());
+    } else {
+        ElementAddKernel<<<GetBlockNum(n), kBlockSize>>>(static_cast<const float*>(a.GetData()),
+            static_cast<const float*>(b_data), static_cast<float*>(y.GetData()), n);
+    }
     CheckLastKernelError("ElementAddKernel(a + b_data)");
 
     return y;
@@ -495,6 +609,52 @@ Tensor CudaSoftmax(const Tensor& x, int device_id) {
     return y;
 }
 
+CudaTensor CudaEmbeddingBatch(const void* embedding_data, const std::vector<int>& embedding_shape,
+                              const int* tokens, int rows, int device_id) {
+    if (!tokens || rows <= 0 || rows > 65535) {
+        throw std::invalid_argument("CudaEmbeddingBatch: invalid token batch");
+    }
+    for (int row = 0; row < rows; ++row) {
+        ValidateEmbeddingDeviceWeightInput(embedding_data, embedding_shape, tokens[row]);
+    }
+    const int dim = embedding_shape[1];
+    CudaDeviceBuffer token_ids(static_cast<size_t>(rows) * sizeof(int), device_id);
+    token_ids.Upload(tokens, static_cast<size_t>(rows) * sizeof(int));
+    CudaTensor result({rows, dim}, device_id);
+    EmbeddingBatchKernel<<<dim3(GetBlockNum(dim), rows), kBlockSize>>>(
+        static_cast<const float*>(embedding_data), static_cast<const int*>(token_ids.GetData()),
+        static_cast<float*>(result.GetData()), dim);
+    CheckLastKernelError("EmbeddingBatchKernel");
+    return result;
+}
+
+int CudaArgMax(const CudaTensor& logits, CudaDeviceBuffer& workspace) {
+    if (logits.Empty() || logits.GetSize() > INT_MAX || logits.GetDimNum() != 1) {
+        throw std::runtime_error("CudaArgMax: expected a non-empty logits vector");
+    }
+    const int size = static_cast<int>(logits.GetSize());
+    const int blocks = std::min(1024, 1 + (size - 1) / kBlockSize);
+    const size_t bytes = static_cast<size_t>(blocks) * sizeof(ArgMaxCandidate) + sizeof(int);
+    const int device = logits.GetDeviceId();
+    if (workspace.GetBytes() < bytes || workspace.GetDeviceId() != device) {
+        workspace.Reset(bytes, device);
+    }
+    CudaSetDevice(device);
+    auto* block_results = static_cast<ArgMaxCandidate*>(workspace.GetData());
+    auto* result = reinterpret_cast<int*>(block_results + blocks);
+    ArgMaxBlocksKernel<<<blocks, kBlockSize>>>(
+        static_cast<const float*>(logits.GetData()), size, block_results);
+    CheckLastKernelError("ArgMaxBlocksKernel");
+    ArgMaxResultKernel<<<1, kBlockSize>>>(block_results, blocks, result);
+    CheckLastKernelError("ArgMaxResultKernel");
+    int token;
+    CudaMemcpyBytes(&token, result, sizeof(token), MemcpyKind::kDeviceToHost);
+    if (token < 0) {
+        throw std::runtime_error("ValidateLogits: logits data is not finite");
+    }
+    return token;
+}
+
 CudaTensor CudaEmbedding(const void* embedding_data, const std::vector<int>& embedding_shape, int token_id, int device_id) {
     ValidateEmbeddingDeviceWeightInput(embedding_data, embedding_shape, token_id);
     CudaSetDevice(device_id);
@@ -532,6 +692,34 @@ void CudaRope(Tensor& q, Tensor& k, int pos, float theta, RopeType type, int dev
     }
     q_dev.Download(q.data.data(), q.Size() * sizeof(float));
     k_dev.Download(k.data.data(), k.Size() * sizeof(float));
+}
+
+void CudaRopeDeviceBatch(CudaTensor& q, CudaTensor& k, int n_heads, int n_kv_heads, int head_dim,
+                         int start_pos, float theta, RopeType type, int device_id) {
+    const auto q_shape = q.Shape();
+    const auto k_shape = k.Shape();
+    if (q.GetDeviceId() != device_id || k.GetDeviceId() != device_id ||
+        n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || head_dim % 2 != 0 ||
+        start_pos < 0 || !std::isfinite(theta) || theta <= 0.0f ||
+        q_shape.size() != 2 || k_shape.size() != 2 || q_shape[0] != k_shape[0] ||
+        static_cast<size_t>(q_shape[1]) != static_cast<size_t>(n_heads) * head_dim ||
+        static_cast<size_t>(k_shape[1]) != static_cast<size_t>(n_kv_heads) * head_dim ||
+        q_shape[0] > 65535 || start_pos > INT_MAX - (q_shape[0] - 1)) {
+        throw std::invalid_argument("CudaRopeDeviceBatch: invalid batch shape, device, or position");
+    }
+    CudaSetDevice(device_id);
+    const auto rotate = [&](CudaTensor& tensor, int heads) {
+        const dim3 grid(GetBlockNum(heads * (head_dim / 2)), q_shape[0]);
+        auto* data = static_cast<float*>(tensor.GetData());
+        if (type == RopeType::kNeoX) {
+            RopeNeoXKernel<<<grid, kBlockSize>>>(data, heads, head_dim, start_pos, theta);
+        } else {
+            RopeNormalKernel<<<grid, kBlockSize>>>(data, heads, head_dim, start_pos, theta);
+        }
+        CheckLastKernelError("CudaRopeDeviceBatch");
+    };
+    rotate(q, n_heads);
+    rotate(k, n_kv_heads);
 }
 
 void CudaRopeDeviceInput(CudaTensor& q, CudaTensor& k, int n_heads, int n_kv_heads, int head_dim, int pos, float theta, RopeType type, int device_id) {

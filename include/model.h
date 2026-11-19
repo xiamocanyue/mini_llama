@@ -53,6 +53,8 @@ struct CudaUploadedWeight {
 
 struct CudaModelWeights {
     int device_id = 0;
+    bool batch_prefill_enabled = false;
+    bool device_greedy_enabled = false;
     size_t uploaded_weight_count = 0;
     size_t uploaded_bytes = 0;
     size_t linear_calls = 0;
@@ -102,6 +104,18 @@ size_t ModelCudaUploadedQ41WeightCount(const MiniLlamaModel& model);
 
 size_t ModelCudaMemoryBytes(const MiniLlamaModel& model);
 
+struct CudaModelOpStats {
+    size_t linear_calls = 0;
+    size_t activation_calls = 0;
+    size_t attention_calls = 0;
+    size_t attention_cpu_fallbacks = 0;
+    size_t kv_cache_read_bytes = 0;
+    size_t kv_cache_write_bytes = 0;
+
+    CudaModelOpStats Since(const CudaModelOpStats& start) const;
+};
+
+CudaModelOpStats GetCudaModelOpStats(const MiniLlamaModel& model);
 void ResetModelCudaRuntimeStats(MiniLlamaModel& model);
 
 size_t ModelCudaLinearCalls(const MiniLlamaModel& model);
